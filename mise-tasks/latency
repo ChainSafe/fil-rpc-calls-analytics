@@ -1,0 +1,28 @@
+#!/usr/bin/env python
+#MISE description="Singleton-only per-method latency in ms (p50/p95/p99). Set PARQUET=path to switch input."
+
+import os
+import polars as pl
+
+parquet = os.environ.get("PARQUET", "calls.parquet")
+print(f"parquet: {parquet}")
+
+out = (
+    pl.scan_parquet(parquet)
+      .filter(pl.col("batch_size") == 1)
+      .group_by("method")
+      .agg(
+          pl.len().alias("n"),
+          pl.col("duration_ms").mean().round(1).alias("avg"),
+          pl.col("duration_ms").quantile(0.5).round(1).alias("p50"),
+          pl.col("duration_ms").quantile(0.95).round(1).alias("p95"),
+          pl.col("duration_ms").quantile(0.99).round(1).alias("p99"),
+          pl.col("duration_ms").max().round(1).alias("max"),
+      )
+      .sort("n", descending=True)
+      .head(30)
+      .collect()
+)
+
+with pl.Config(tbl_rows=30, tbl_width_chars=120):
+    print(out)

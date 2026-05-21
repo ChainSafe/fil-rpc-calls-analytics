@@ -1,0 +1,81 @@
+#!/usr/bin/env python
+#MISE description="Per-method latency diff between two parquet files (args: <before.parquet> <after.parquet> [top_n] [sort])"
+
+import sys
+import polars as pl
+
+if len(sys.argv) < 3:
+    print("usage: mise run compare <before.parquet> <after.parquet> [top_n=30] [sort=n|p50|p95|p99|mean]",
+          file=sys.stderr)
+    sys.exit(2)
+
+before_path = sys.argv[1]
+after_path = sys.argv[2]
+top_n = int(sys.argv[3]) if len(sys.argv) > 3 else 30
+sort_key = sys.argv[4] if len(sys.argv) > 4 else "n"
+
+
+def summarise(path: str) -> pl.DataFrame:
+    return (
+        pl.scan_parquet(path)
+          .filter(pl.col("batch_size") == 1)
+          .group_by("method")
+          .agg(
+              pl.len().alias("n"),
+              pl.col("duration_ms").mean().alias("mean"),
+              pl.col("duration_ms").quantile(0.5).alias("p50"),
+              pl.col("duration_ms").quantile(0.95).alias("p95"),
+              pl.col("duration_ms").quantile(0.99).alias("p99"),
+          )
+          .collect()
+    )
+
+
+metrics = ["n", "mean", "p50", "p95", "p99"]
+before = summarise(before_path).rename({c: f"{c}_a" for c in metrics})
+after = summarise(after_path).rename({c: f"{c}_b" for c in metrics})
+joined = before.join(after, on="method", how="full", coalesce=True)
+
+deltas = joined.with_columns(
+    (pl.col("mean_b") - pl.col("mean_a")).alias("d_mean"),
+    (pl.col("p50_b") - pl.col("p50_a")).alias("d_p50"),
+    (pl.col("p95_b") - pl.col("p95_a")).alias("d_p95"),
+    (pl.col("p99_b") - pl.col("p99_a")).alias("d_p99"),
+)
+
+sort_col_map = {
+    "n": pl.max_horizontal("n_a", "n_b"),
+    "mean": pl.col("d_mean").abs(),
+    "p50": pl.col("d_p50").abs(),
+    "p95": pl.col("d_p95").abs(),
+    "p99": pl.col("d_p99").abs(),
+}
+if sort_key not in sort_col_map:
+    print(f"unknown sort key '{sort_key}', falling back to 'n'", file=sys.stderr)
+    sort_key = "n"
+
+ranked = deltas.sort(sort_col_map[sort_key], descending=True, nulls_last=True).head(top_n)
+
+# Two narrow tables side-by-side is cramped in a terminal; print mean and percentile
+# tables separately so each fits comfortably.
+def render(title: str, metric: str, sub: pl.DataFrame) -> None:
+    print(f"\n== {title} ==")
+    table = sub.select(
+        "method",
+        pl.col("n_a").fill_null(0),
+        pl.col("n_b").fill_null(0),
+        pl.col(f"{metric}_a").round(1).alias("before"),
+        pl.col(f"{metric}_b").round(1).alias("after"),
+        pl.col(f"d_{metric}").round(1).alias("delta"),
+    )
+    with pl.Config(tbl_rows=top_n, tbl_width_chars=160, fmt_str_lengths=60):
+        print(table)
+
+
+print(f"before: {before_path}")
+print(f"after:  {after_path}")
+print(f"sort:   {sort_key}   top_n: {top_n}")
+render("mean (ms)", "mean", ranked)
+render("p50 (ms)", "p50", ranked)
+render("p95 (ms)", "p95", ranked)
+render("p99 (ms)", "p99", ranked)

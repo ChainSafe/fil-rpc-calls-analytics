@@ -1,0 +1,4 @@
+*.log
+*.parquet
+*.mitm
+*.out

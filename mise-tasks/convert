@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+#MISE description="Convert <input.mitm> (default flows.mitm) -> calls*.parquet"
+#MISE depends=["install"]
+set -euo pipefail
+
+input="${1:-flows.mitm}"
+output="${input/flows/calls}"
+output="${output%.mitm}.parquet"
+
+python flows_to_parquet.py "$input" "$output"

@@ -1,0 +1,12 @@
+#!/usr/bin/env python
+#MISE description="Show schema and first rows of a parquet file. Set PARQUET=path to switch input."
+
+import os
+import polars as pl
+
+parquet = os.environ.get("PARQUET", "calls.parquet")
+print(f"parquet: {parquet}")
+
+df = pl.scan_parquet(parquet)
+print(df.collect_schema())
+print(df.head(5).collect())
