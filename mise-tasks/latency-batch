@@ -1,0 +1,67 @@
+#!/usr/bin/env python
+#MISE description="Per-flow latency for BATCHED requests (batch_size > 1). Set PARQUET=path to switch input."
+
+import os
+import polars as pl
+
+parquet = os.environ.get("PARQUET", "calls.parquet")
+print(f"parquet: {parquet}")
+
+calls = pl.scan_parquet(parquet).filter(pl.col("batch_size") > 1)
+
+# One row per flow — duration_ms is shared by every call inside the batch.
+flows = (
+    calls.group_by("flow_id")
+         .agg(
+             pl.col("batch_size").first(),
+             pl.col("duration_ms").first(),
+         )
+)
+
+print()
+print("Per-flow latency by batch-size bucket:")
+buckets = flows.with_columns(
+    pl.when(pl.col("batch_size") <= 10).then(pl.lit("2-10"))
+      .when(pl.col("batch_size") <= 50).then(pl.lit("11-50"))
+      .when(pl.col("batch_size") <= 99).then(pl.lit("51-99"))
+      .otherwise(pl.lit("100+"))
+      .alias("bucket")
+)
+out = (
+    buckets.group_by("bucket")
+           .agg(
+               pl.len().alias("flows"),
+               pl.col("duration_ms").mean().round(1).alias("avg"),
+               pl.col("duration_ms").quantile(0.5).round(1).alias("p50"),
+               pl.col("duration_ms").quantile(0.95).round(1).alias("p95"),
+               pl.col("duration_ms").quantile(0.99).round(1).alias("p99"),
+               pl.col("duration_ms").max().round(1).alias("max"),
+           )
+           .sort("bucket")
+           .collect()
+)
+with pl.Config(tbl_rows=20, tbl_width_chars=140):
+    print(out)
+
+print()
+print("Per-method membership in batches (latency is flow-level — shared across all calls in that flow):")
+# Dedupe (flow_id, method) so a method appearing N times in one batch counts as 1 flow.
+per_method = (
+    calls.unique(subset=["flow_id", "method"])
+         .join(flows, on="flow_id", how="inner")
+         .group_by("method")
+         .agg(
+             pl.len().alias("flows"),
+             pl.col("batch_size_right").median().alias("median_batch"),
+             pl.col("duration_ms_right").mean().round(1).alias("avg"),
+             pl.col("duration_ms_right").quantile(0.5).round(1).alias("p50"),
+             pl.col("duration_ms_right").quantile(0.95).round(1).alias("p95"),
+             pl.col("duration_ms_right").quantile(0.99).round(1).alias("p99"),
+             pl.col("duration_ms_right").max().round(1).alias("max"),
+         )
+         .sort("flows", descending=True)
+         .head(30)
+         .collect()
+)
+with pl.Config(tbl_rows=30, tbl_width_chars=140):
+    print(per_method)

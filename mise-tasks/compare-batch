@@ -1,0 +1,94 @@
+#!/usr/bin/env python
+#MISE description="Batch efficiency diff between two parquet files (args: <before.parquet> <after.parquet>)"
+
+import sys
+import polars as pl
+
+if len(sys.argv) < 3:
+    print("usage: mise run compare-batch <before.parquet> <after.parquet>", file=sys.stderr)
+    sys.exit(2)
+
+before_path = sys.argv[1]
+after_path = sys.argv[2]
+
+
+def flow_table(path: str) -> pl.DataFrame:
+    """One row per batched flow with duration and per-call amortized cost."""
+    return (
+        pl.scan_parquet(path)
+          .filter(pl.col("batch_size") > 1)
+          .group_by("flow_id")
+          .agg(
+              pl.col("batch_size").first(),
+              pl.col("duration_ms").first(),
+          )
+          .with_columns(
+              (pl.col("duration_ms") / pl.col("batch_size")).alias("per_call_ms"),
+              pl.when(pl.col("batch_size") <= 10).then(pl.lit("2-10"))
+                .when(pl.col("batch_size") <= 50).then(pl.lit("11-50"))
+                .when(pl.col("batch_size") <= 99).then(pl.lit("51-99"))
+                .otherwise(pl.lit("100+"))
+                .alias("bucket"),
+          )
+          .collect()
+    )
+
+
+def summarise(df: pl.DataFrame, col: str) -> pl.DataFrame:
+    return (
+        df.group_by("bucket")
+          .agg(
+              pl.len().alias("flows"),
+              pl.col(col).mean().alias("avg"),
+              pl.col(col).quantile(0.5).alias("p50"),
+              pl.col(col).quantile(0.95).alias("p95"),
+              pl.col(col).quantile(0.99).alias("p99"),
+          )
+    )
+
+
+BUCKETS = ["2-10", "11-50", "51-99", "100+"]
+METRICS = ["flows", "avg", "p50", "p95", "p99"]
+
+
+def render(title: str, col: str, a: pl.DataFrame, b: pl.DataFrame) -> None:
+    sa = summarise(a, col).rename({m: f"{m}_a" for m in METRICS})
+    sb = summarise(b, col).rename({m: f"{m}_b" for m in METRICS})
+    joined = (
+        sa.join(sb, on="bucket", how="full", coalesce=True)
+          .with_columns(
+              ((pl.col("avg_b") - pl.col("avg_a")) / pl.col("avg_a") * 100).alias("Δavg%"),
+              ((pl.col("p50_b") - pl.col("p50_a")) / pl.col("p50_a") * 100).alias("Δp50%"),
+              ((pl.col("p95_b") - pl.col("p95_a")) / pl.col("p95_a") * 100).alias("Δp95%"),
+          )
+          .select(
+              "bucket",
+              pl.col("flows_a").fill_null(0),
+              pl.col("flows_b").fill_null(0),
+              pl.col("avg_a").round(1),
+              pl.col("avg_b").round(1),
+              pl.col("Δavg%").round(1),
+              pl.col("p50_a").round(1),
+              pl.col("p50_b").round(1),
+              pl.col("Δp50%").round(1),
+              pl.col("p95_a").round(1),
+              pl.col("p95_b").round(1),
+              pl.col("Δp95%").round(1),
+          )
+          .sort("bucket", descending=False)
+    )
+    # Pin the bucket order.
+    order = pl.DataFrame({"bucket": BUCKETS})
+    joined = order.join(joined, on="bucket", how="left").filter(pl.col("flows_a").is_not_null() | pl.col("flows_b").is_not_null())
+    print(f"\n== {title} ==")
+    with pl.Config(tbl_rows=10, tbl_width_chars=300, tbl_cols=20):
+        print(joined)
+
+
+a = flow_table(before_path)
+b = flow_table(after_path)
+
+print(f"before: {before_path}   batched flows: {a.height}")
+print(f"after:  {after_path}   batched flows: {b.height}")
+render("Per-flow duration (ms) — wall time for the whole batch", "duration_ms", a, b)
+render("Per-call amortized (ms) — duration_ms / batch_size", "per_call_ms", a, b)
