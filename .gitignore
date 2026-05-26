@@ -2,3 +2,4 @@
 *.parquet
 *.mitm
 *.out
+__pycache__/
