@@ -1,0 +1,119 @@
+#!/usr/bin/env python
+#MISE description="High-level analytics for a parquet capture: counts, reply rate, batches, top methods, errors. Set PARQUET=path to switch input."
+
+import os
+import polars as pl
+
+parquet = os.environ.get("PARQUET", "calls.parquet")
+print(f"parquet: {parquet}\n")
+
+df = pl.scan_parquet(parquet)
+
+# ---- capture window ----
+from datetime import datetime, timezone
+ts = df.unique(subset=["flow_id"]).select(
+    pl.col("ts_start").min().alias("first"),
+    pl.col("ts_start").max().alias("last"),
+).collect()
+first, last = ts["first"][0], ts["last"][0]
+if first is not None and last is not None:
+    span_s = last - first
+    fmt = lambda t: datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    h, rem = divmod(int(span_s), 3600)
+    m, s = divmod(rem, 60)
+    print(f"capture span:     {fmt(first)} → {fmt(last)}")
+    print(f"  duration:       {h}h {m:02d}m {s:02d}s ({span_s:,.0f}s)")
+    print()
+
+# ---- counts ----
+rows = df.select(pl.len()).collect().item()
+flows = df.select(pl.col("flow_id").n_unique()).collect().item()
+no_resp = df.filter(pl.col("http_status").is_null()).select(pl.col("flow_id").n_unique()).collect().item()
+replied = flows - no_resp
+print(f"rows (RPC calls): {rows:>12,}")
+print(f"flows (HTTP req): {flows:>12,}")
+print(f"  replied:        {replied:>12,}  ({replied/flows*100:.1f}%)")
+print(f"  no response:    {no_resp:>12,}  ({no_resp/flows*100:.1f}%)")
+
+with_result = df.filter(pl.col("result_json").is_not_null()).select(pl.len()).collect().item()
+with_error  = df.filter(pl.col("error_code").is_not_null()).select(pl.len()).collect().item()
+print(f"\ncall-level outcomes (over all rows):")
+print(f"  success (result): {with_result:>10,}  ({with_result/rows*100:.1f}%)")
+print(f"  error:            {with_error:>10,}  ({with_error/rows*100:.1f}%)")
+print(f"  no answer:        {rows - with_result - with_error:>10,}  ({(rows-with_result-with_error)/rows*100:.1f}%)")
+
+# ---- batch distribution ----
+print("\nBatch size buckets (per flow):")
+per_flow = df.unique(subset=["flow_id"]).with_columns(
+    pl.when(pl.col("batch_size") == 1).then(pl.lit("1"))
+      .when(pl.col("batch_size") <= 10).then(pl.lit("2-10"))
+      .when(pl.col("batch_size") <= 50).then(pl.lit("11-50"))
+      .when(pl.col("batch_size") <= 99).then(pl.lit("51-99"))
+      .otherwise(pl.lit("100+"))
+      .alias("bucket")
+).collect()
+bucket_order = pl.DataFrame({"bucket": ["1", "2-10", "11-50", "51-99", "100+"]})
+buckets = (
+    per_flow.group_by("bucket")
+            .agg(pl.len().alias("flows"),
+                 (pl.col("batch_size").sum()).alias("calls"))
+)
+buckets = bucket_order.join(buckets, on="bucket", how="left").fill_null(0)
+with pl.Config(tbl_rows=10, tbl_width_chars=80):
+    print(buckets)
+
+# ---- per-flow latency ----
+durations = df.unique(subset=["flow_id"]).filter(pl.col("duration_ms").is_not_null())
+lat = durations.select(
+    pl.col("duration_ms").mean().round(1).alias("avg"),
+    pl.col("duration_ms").quantile(0.5).round(1).alias("p50"),
+    pl.col("duration_ms").quantile(0.95).round(1).alias("p95"),
+    pl.col("duration_ms").quantile(0.99).round(1).alias("p99"),
+    pl.col("duration_ms").max().round(1).alias("max"),
+).collect()
+print("\nPer-flow latency (replied flows only, ms):")
+print(lat)
+
+# ---- body sizes ----
+sizes = df.unique(subset=["flow_id"]).select(
+    pl.col("flow_req_bytes").quantile(0.5).alias("req_p50"),
+    pl.col("flow_req_bytes").quantile(0.95).alias("req_p95"),
+    pl.col("flow_req_bytes").max().alias("req_max"),
+    pl.col("flow_resp_bytes").quantile(0.5).alias("resp_p50"),
+    pl.col("flow_resp_bytes").quantile(0.95).alias("resp_p95"),
+    pl.col("flow_resp_bytes").max().alias("resp_max"),
+).collect()
+print("\nBody sizes (bytes):")
+print(sizes)
+
+# ---- top methods ----
+print("\nTop 15 methods by call count:")
+print(
+    df.group_by("method")
+      .agg(pl.len().alias("calls"),
+           pl.col("flow_id").n_unique().alias("flows"))
+      .sort("calls", descending=True)
+      .head(15)
+      .collect()
+)
+
+# ---- error breakdown ----
+print("\nTop error codes (RPC layer):")
+print(
+    df.filter(pl.col("error_code").is_not_null())
+      .group_by("error_code")
+      .agg(pl.len().alias("calls"))
+      .sort("calls", descending=True)
+      .head(10)
+      .collect()
+)
+
+# ---- http status ----
+print("\nHTTP status distribution:")
+print(
+    df.unique(subset=["flow_id"])
+      .group_by("http_status")
+      .agg(pl.len().alias("flows"))
+      .sort("flows", descending=True)
+      .collect()
+)

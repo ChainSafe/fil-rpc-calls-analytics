@@ -33,8 +33,24 @@ SCHEMA = pa.schema([
 ])
 
 
-def _process_flow(flow_id: int, flow) -> list[dict]:
+def _client_ip(flow) -> str:
+    """Originating IP per X-Forwarded-For/X-Real-IP, else direct TCP peer."""
+    xff = flow.request.headers.get("X-Forwarded-For", "") if hasattr(flow, "request") else ""
+    if xff:
+        return xff.split(",")[0].strip()
+    xri = flow.request.headers.get("X-Real-IP", "") if hasattr(flow, "request") else ""
+    if xri:
+        return xri.strip()
+    if getattr(flow, "client_conn", None) and flow.client_conn.peername:
+        return flow.client_conn.peername[0]
+    return ""
+
+
+def _process_flow(flow_id: int, flow, banned_ips: set[str]) -> list[dict]:
     if not hasattr(flow, "request") or flow.request.method != "POST":
+        return []
+
+    if banned_ips and _client_ip(flow) in banned_ips:
         return []
 
     req_text = flow.request.get_text() or ""
@@ -145,17 +161,23 @@ def main() -> None:
     ap.add_argument("output", type=Path, help="output .parquet file")
     ap.add_argument("--compression", default="zstd", choices=["zstd", "snappy", "gzip", "none"])
     ap.add_argument("--batch", type=int, default=50_000, help="rows per Parquet row-group flush")
+    ap.add_argument("--ban-ips", default="", help="comma-separated client IPs to exclude")
     args = ap.parse_args()
+    banned_ips = {ip.strip() for ip in args.ban_ips.split(",") if ip.strip()}
 
     compression = None if args.compression == "none" else args.compression
 
     flow_id = 0
     written = 0
+    skipped = 0
     buf: list[dict] = []
     with args.input.open("rb") as f, pq.ParquetWriter(args.output, SCHEMA, compression=compression) as writer:
         for flow in mitm_io.FlowReader(f).stream():
             flow_id += 1
-            buf.extend(_process_flow(flow_id, flow))
+            if banned_ips and hasattr(flow, "request") and _client_ip(flow) in banned_ips:
+                skipped += 1
+                continue
+            buf.extend(_process_flow(flow_id, flow, banned_ips))
             if len(buf) >= args.batch:
                 _flush(writer, buf)
                 written += len(buf)
@@ -166,7 +188,8 @@ def main() -> None:
             _flush(writer, buf)
             written += len(buf)
 
-    print(f"done: {written:,} rows from {flow_id:,} flows -> {args.output}", file=sys.stderr)
+    extra = f" (skipped {skipped:,} banned-IP flows)" if banned_ips else ""
+    print(f"done: {written:,} rows from {flow_id:,} flows{extra} -> {args.output}", file=sys.stderr)
 
 
 if __name__ == "__main__":

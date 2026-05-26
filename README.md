@@ -15,7 +15,10 @@ All analysis tasks read `calls.parquet` by default; override with `PARQUET=path 
 | Task | What it shows |
 |---|---|
 | `convert [input.mitm]` | `flows*.mitm` → `calls*.parquet` (default `flows.mitm` → `calls.parquet`) |
+| `summary` | High-level analytics: counts, reply rate, batches, latency, top methods, errors |
 | `latency` | Per-method p50/p95/p99/avg/max, singleton flows only |
+| `latency-batch` | Per-flow latency for batched requests, by bucket and by method |
+| `compare-batch <before> <after>` | Batch-efficiency diff between two parquet files |
 | `slow [method] [top_n]` | Slowest individual flows; full params via `PARAMS_CAP=0` |
 | `popular [method] [top_params]` | Most-used methods and their most common params |
 | `errors` | Error rates per method |
