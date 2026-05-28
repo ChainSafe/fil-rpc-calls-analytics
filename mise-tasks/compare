@@ -75,6 +75,44 @@ def render(title: str, metric: str, sub: pl.DataFrame) -> None:
 print(f"before: {before_path}")
 print(f"after:  {after_path}")
 print(f"sort:   {sort_key}   top_n: {top_n}")
+
+
+def overall(path: str) -> dict:
+    df = pl.scan_parquet(path).filter(pl.col("duration_ms").is_not_null())
+    flow = df.unique(subset=["flow_id"])
+    f = flow.select(
+        pl.col("duration_ms").mean().alias("avg"),
+        pl.col("duration_ms").quantile(0.5).alias("p50"),
+        pl.col("duration_ms").quantile(0.95).alias("p95"),
+        pl.col("duration_ms").quantile(0.99).alias("p99"),
+    ).collect().row(0)
+    c = df.with_columns(
+        (pl.col("duration_ms") / pl.col("batch_size")).alias("per_call_ms")
+    ).select(
+        pl.col("per_call_ms").mean().alias("avg"),
+        pl.col("per_call_ms").quantile(0.5).alias("p50"),
+        pl.col("per_call_ms").quantile(0.95).alias("p95"),
+        pl.col("per_call_ms").quantile(0.99).alias("p99"),
+    ).collect().row(0)
+    return {"flow": f, "call": c}
+
+
+def render_overall(title: str, kind: str, dp: int):
+    a = oa[kind]; b = ob[kind]
+    print(f"\n== overall {title} (ms, method-agnostic) ==")
+    print(f"  {'metric':<6}  {'before':>10}  {'after':>10}  {'Δ':>10}  {'Δ%':>7}")
+    for i, label in enumerate(["avg", "p50", "p95", "p99"]):
+        bv, av = a[i], b[i]
+        d = av - bv
+        pct = (d / bv * 100) if bv else 0.0
+        print(f"  {label:<6}  {bv:>10.{dp}f}  {av:>10.{dp}f}  {d:>+10.{dp}f}  {pct:>+6.1f}%")
+
+
+oa = overall(before_path)
+ob = overall(after_path)
+render_overall("per-flow latency", "flow", 1)
+render_overall("per-call amortized (duration/batch_size)", "call", 2)
+
 render("mean (ms)", "mean", ranked)
 render("p50 (ms)", "p50", ranked)
 render("p95 (ms)", "p95", ranked)

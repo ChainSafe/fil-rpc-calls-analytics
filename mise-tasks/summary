@@ -62,17 +62,32 @@ buckets = bucket_order.join(buckets, on="bucket", how="left").fill_null(0)
 with pl.Config(tbl_rows=10, tbl_width_chars=80):
     print(buckets)
 
-# ---- per-flow latency ----
-durations = df.unique(subset=["flow_id"]).filter(pl.col("duration_ms").is_not_null())
-lat = durations.select(
+# ---- latency (method-agnostic) ----
+flow_lat = df.unique(subset=["flow_id"]).filter(pl.col("duration_ms").is_not_null())
+flow_stats = flow_lat.select(
     pl.col("duration_ms").mean().round(1).alias("avg"),
     pl.col("duration_ms").quantile(0.5).round(1).alias("p50"),
     pl.col("duration_ms").quantile(0.95).round(1).alias("p95"),
     pl.col("duration_ms").quantile(0.99).round(1).alias("p99"),
     pl.col("duration_ms").max().round(1).alias("max"),
 ).collect()
-print("\nPer-flow latency (replied flows only, ms):")
-print(lat)
+print("\nPer-flow latency — wall time per HTTP request (ms):")
+print(flow_stats)
+
+# Per-call amortized: duration_ms / batch_size, sampled at every row so
+# a 100-call batch contributes 100 datapoints of (duration/100) each.
+call_lat = df.filter(pl.col("duration_ms").is_not_null()).with_columns(
+    (pl.col("duration_ms") / pl.col("batch_size")).alias("per_call_ms")
+)
+call_stats = call_lat.select(
+    pl.col("per_call_ms").mean().round(2).alias("avg"),
+    pl.col("per_call_ms").quantile(0.5).round(2).alias("p50"),
+    pl.col("per_call_ms").quantile(0.95).round(2).alias("p95"),
+    pl.col("per_call_ms").quantile(0.99).round(2).alias("p99"),
+    pl.col("per_call_ms").max().round(2).alias("max"),
+).collect()
+print("\nPer-call amortized latency — duration_ms / batch_size (ms):")
+print(call_stats)
 
 # ---- body sizes ----
 sizes = df.unique(subset=["flow_id"]).select(
