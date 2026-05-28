@@ -7,6 +7,6 @@ _.python.venv = { path = ".venv", create = true }
 
 [tasks.install]
 description = "Install Python deps"
-run = "uv pip install mitmproxy pyarrow polars"
+run = "uv pip install mitmproxy pyarrow polars brotli zstandard altair vl-convert-python pandas"
 
 

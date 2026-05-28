@@ -1,0 +1,119 @@
+#!/usr/bin/env python
+#MISE description="Render latency-reduction comparison charts (Altair SVG). Args: <before.parquet> <after.parquet>. CHARTS_DIR=out."
+
+import os
+import sys
+from pathlib import Path
+
+import altair as alt
+import polars as pl
+
+
+if len(sys.argv) < 3:
+    print("usage: mise run charts <before.parquet> <after.parquet>", file=sys.stderr)
+    sys.exit(2)
+
+before_path = sys.argv[1]
+after_path = sys.argv[2]
+out_dir = Path(os.environ.get("CHARTS_DIR", "charts"))
+out_dir.mkdir(exist_ok=True)
+
+
+def latencies(path: str) -> dict[str, dict[str, float]]:
+    df = pl.scan_parquet(path).filter(pl.col("duration_ms").is_not_null())
+    flow = df.unique(subset=["flow_id"])
+    f = flow.select(
+        pl.col("duration_ms").mean().alias("avg"),
+        pl.col("duration_ms").quantile(0.95).alias("p95"),
+        pl.col("duration_ms").quantile(0.99).alias("p99"),
+    ).collect().row(0, named=True)
+    c = df.with_columns(
+        (pl.col("duration_ms") / pl.col("batch_size")).alias("per_call_ms")
+    ).select(
+        pl.col("per_call_ms").mean().alias("avg"),
+        pl.col("per_call_ms").quantile(0.95).alias("p95"),
+        pl.col("per_call_ms").quantile(0.99).alias("p99"),
+    ).collect().row(0, named=True)
+    return {"per-flow": f, "per-call amortized": c}
+
+
+a = latencies(before_path)
+b = latencies(after_path)
+
+rows = []
+for view in ("per-flow", "per-call amortized"):
+    for metric in ("avg", "p95", "p99"):
+        rows.append({"view": view, "metric": metric, "phase": "before", "ms": a[view][metric]})
+        rows.append({"view": view, "metric": metric, "phase": "after",  "ms": b[view][metric]})
+data = pl.DataFrame(rows).to_pandas()
+
+
+GREEN = "#16a34a"
+GREY  = "#9ca3af"
+
+
+def render(view: str, filename: str, title: str) -> None:
+    sub = data[data["view"] == view]
+    # delta % per metric ((after - before) / before)
+    deltas = []
+    sentence_parts = []
+    for metric in ("avg", "p95", "p99"):
+        before_ms = sub[(sub.metric == metric) & (sub.phase == "before")]["ms"].iloc[0]
+        after_ms  = sub[(sub.metric == metric) & (sub.phase == "after")]["ms"].iloc[0]
+        d = (after_ms - before_ms) / before_ms * 100 if before_ms else 0.0
+        verb = "down" if d < 0 else "up"
+        deltas.append({"metric": metric, "label": f"{d:+.1f}%"})
+        sentence_parts.append(f"{metric} {verb} {abs(d):.1f}% ({before_ms:.1f} → {after_ms:.1f} ms)")
+    delta_df = __import__("pandas").DataFrame(deltas)
+
+    base = alt.Chart(sub).encode(
+        x=alt.X("phase:N", sort=["before", "after"], title=None,
+                axis=alt.Axis(labelAngle=0, labelPadding=4),
+                scale=alt.Scale(paddingInner=0.4, paddingOuter=0.3)),
+        y=alt.Y("ms:Q", title="latency (ms)"),
+    )
+    bars = base.mark_bar(size=42).encode(
+        color=alt.Color("phase:N",
+                        scale=alt.Scale(domain=["before", "after"],
+                                        range=[GREY, GREEN]),
+                        legend=None),
+        tooltip=["metric", "phase", alt.Tooltip("ms:Q", format=".1f")],
+    )
+    labels = base.mark_text(dy=-6, fontSize=11).encode(
+        text=alt.Text("ms:Q", format=".1f"),
+    )
+    bar_chart = (
+        alt.layer(bars, labels)
+           .properties(width=170, height=280)
+           .facet(column=alt.Column("metric:N", sort=["avg", "p95", "p99"],
+                                    title=None, header=alt.Header(labelFontSize=13)),
+                  spacing=40)
+    )
+
+    # Delta percentage row, faceted so it aligns under each metric panel.
+    delta_chart = (
+        alt.Chart(delta_df)
+           .mark_text(fontSize=15, fontWeight="bold", color=GREEN)
+           .encode(text=alt.Text("label:N"))
+           .properties(width=170, height=24)
+           .facet(column=alt.Column("metric:N", sort=["avg", "p95", "p99"],
+                                    title=None, header=alt.Header(labels=False)),
+                  spacing=40)
+    )
+
+    sentence = "Improvement: " + "; ".join(sentence_parts) + "."
+
+    chart = alt.vconcat(bar_chart, delta_chart).properties(
+        title=alt.TitleParams(text=title, subtitle=sentence, subtitleFontSize=11, subtitleColor="#555"),
+    )
+    path = out_dir / filename
+    chart.save(str(path))
+    print(f"  wrote {path}")
+
+
+print(f"before: {before_path}")
+print(f"after:  {after_path}")
+render("per-flow",            "latency-per-flow.svg",
+       "Per-flow latency: before vs after (ms)")
+render("per-call amortized",  "latency-per-call.svg",
+       "Per-call amortized latency: before vs after (ms)")
