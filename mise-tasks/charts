@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-#MISE description="Render latency-reduction comparison charts (Altair SVG). Args: <before.parquet> <after.parquet>. CHARTS_DIR=out."
+#MISE description="Render latency-reduction comparison charts (Altair SVG). Args: <before.parquet> <after.parquet> [top_n=30]. CHARTS_DIR=out."
 
 import os
 import sys
@@ -15,6 +15,7 @@ if len(sys.argv) < 3:
 
 before_path = sys.argv[1]
 after_path = sys.argv[2]
+top_n = int(sys.argv[3]) if len(sys.argv) > 3 else 30
 out_dir = Path(os.environ.get("CHARTS_DIR", "charts"))
 out_dir.mkdir(exist_ok=True)
 
@@ -111,9 +112,118 @@ def render(view: str, filename: str, title: str) -> None:
     print(f"  wrote {path}")
 
 
+def per_method(path: str) -> pl.DataFrame:
+    """Per-method latency on singleton flows (matches the `compare` task)."""
+    return (
+        pl.scan_parquet(path)
+          .filter(pl.col("batch_size") == 1)
+          .group_by("method")
+          .agg(
+              pl.len().alias("n"),
+              pl.col("duration_ms").mean().alias("mean"),
+              pl.col("duration_ms").quantile(0.95).alias("p95"),
+          )
+          .collect()
+    )
+
+
+def _human(n: float) -> str:
+    """Compact integer-ish formatting for call counts (e.g. 95438 -> 95.4k)."""
+    n = float(n)
+    for unit, div in (("M", 1e6), ("k", 1e3)):
+        if abs(n) >= div:
+            return f"{n / div:.1f}{unit}"
+    return f"{n:.0f}"
+
+
+def render_method(table: pl.DataFrame) -> None:
+    """One combined chart with three aligned before→after dumbbell panels per
+    method: call volume (n_a→n_b), mean latency, and p95 latency. All on log
+    x-scales so the wide value ranges stay readable, and the shared method rows
+    let you read traffic, typical cost, and tail cost together."""
+    import pandas as pd
+
+    # Log axes can't plot null/zero, so keep methods present in both runs. A
+    # method with a latency in both files also has n_a > 0 and n_b > 0.
+    base = table.filter(
+        pl.col("mean_a").is_not_null() & pl.col("mean_b").is_not_null()
+    )
+    order = base["method"].to_list()
+
+    panels = [
+        ("calls",     "n_a",    "n_b",    "count"),
+        ("mean (ms)", "mean_a", "mean_b", "ms"),
+        ("p95 (ms)",  "p95_a",  "p95_b",  "ms"),
+    ]
+
+    rows = []
+    for panel, ca, cb, kind in panels:
+        for r in base.iter_rows(named=True):
+            bef, aft = r[ca], r[cb]
+            if bef is None or aft is None:
+                continue
+            d = aft - bef
+            label = (f"{'+' if d >= 0 else '-'}{_human(abs(d))}"
+                     if kind == "count" else f"{d:+.1f}")
+            for phase, value in (("before", bef), ("after", aft)):
+                rows.append({"method": r["method"], "panel": panel,
+                             "phase": phase, "value": value,
+                             "before": bef, "after": aft, "label": label})
+
+    long = pd.DataFrame(rows)
+
+    y = alt.Y("method:N", sort=order, title=None,
+              axis=alt.Axis(labelLimit=320, labelFontSize=11))
+    logx = alt.Scale(type="log")
+    after_only = alt.datum.phase == "after"
+
+    rules = alt.Chart(long).transform_filter(after_only).mark_rule(
+        color=GREY, strokeWidth=2).encode(
+        y=y, x=alt.X("before:Q", scale=logx, title=None), x2="after:Q",
+    )
+    points = alt.Chart(long).mark_point(filled=True, size=80).encode(
+        y=y, x=alt.X("value:Q", scale=logx, title=None),
+        color=alt.Color("phase:N",
+                        scale=alt.Scale(domain=["before", "after"],
+                                        range=[GREY, GREEN]),
+                        legend=alt.Legend(title=None, orient="top")),
+        tooltip=["method", "panel", "phase", alt.Tooltip("value:Q", format=",.1f")],
+    )
+    labels = alt.Chart(long).transform_filter(after_only).mark_text(
+        align="center", dy=-10, fontSize=9, color="#374151").encode(
+        y=y, x=alt.X("after:Q", scale=logx), text="label:N",
+    )
+
+    chart = (
+        alt.layer(rules, points, labels)
+           .properties(width=210, height=max(280, 22 * len(order)))
+           .facet(column=alt.Column("panel:N", sort=[p[0] for p in panels],
+                                    title=None, header=alt.Header(labelFontSize=13)),
+                  spacing=46)
+           .resolve_scale(x="independent")
+           .properties(title=alt.TitleParams(
+               text=f"Per-method latency: before vs after (top {top_n} by calls)",
+               subtitle="before (grey) → after (green); calls panel = traffic volume (n_a→n_b); labels = Δ",
+               subtitleFontSize=11, subtitleColor="#555"))
+    )
+    path = out_dir / "latency-per-method.svg"
+    chart.save(str(path))
+    print(f"  wrote {path}")
+
+
 print(f"before: {before_path}")
 print(f"after:  {after_path}")
 render("per-flow",            "latency-per-flow.svg",
        "Per-flow latency: before vs after (ms)")
 render("per-call amortized",  "latency-per-call.svg",
        "Per-call amortized latency: before vs after (ms)")
+
+qcols = ("n", "mean", "p95")
+ma = per_method(before_path).rename({c: f"{c}_a" for c in qcols})
+mb = per_method(after_path).rename({c: f"{c}_b" for c in qcols})
+method_table = (
+    ma.join(mb, on="method", how="full", coalesce=True)
+      .sort(pl.max_horizontal("n_a", "n_b"), descending=True, nulls_last=True)
+      .head(top_n)
+)
+render_method(method_table)
