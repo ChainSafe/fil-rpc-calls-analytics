@@ -51,6 +51,7 @@ data = pl.DataFrame(rows).to_pandas()
 
 GREEN = "#16a34a"
 GREY  = "#9ca3af"
+RED   = "#dc2626"
 
 
 def render(view: str, filename: str, title: str) -> None:
@@ -211,6 +212,120 @@ def render_method(table: pl.DataFrame) -> None:
     print(f"  wrote {path}")
 
 
+BUCKETS = ["2-10", "11-50", "51-99", "100+"]
+
+
+def batch_table(path: str) -> pl.DataFrame:
+    return (
+        pl.scan_parquet(path)
+          .filter(pl.col("batch_size") > 1)
+          .group_by("flow_id")
+          .agg(
+              pl.col("batch_size").first(),
+              pl.col("duration_ms").first(),
+          )
+          .with_columns(
+              (pl.col("duration_ms") / pl.col("batch_size")).alias("per_call_ms"),
+              pl.when(pl.col("batch_size") <= 10).then(pl.lit("2-10"))
+                .when(pl.col("batch_size") <= 50).then(pl.lit("11-50"))
+                .when(pl.col("batch_size") <= 99).then(pl.lit("51-99"))
+                .otherwise(pl.lit("100+"))
+                .alias("bucket"),
+          )
+          .collect()
+    )
+
+
+def batch_summary(path: str, col: str) -> pl.DataFrame:
+    return (
+        batch_table(path)
+          .group_by("bucket")
+          .agg(
+              pl.len().alias("flows"),
+              pl.col(col).mean().alias("avg"),
+              pl.col(col).quantile(0.95).alias("p95"),
+          )
+    )
+
+
+def render_batch(col: str, filename: str, title: str) -> None:
+    """Horizontal dumbbells: bucket on y, latency on x (avg and p95)."""
+    import pandas as pd
+
+    sa = batch_summary(before_path, col)
+    sb = batch_summary(after_path, col)
+    rows, parts, y_order = [], [], []
+    for bucket in BUCKETS:
+        ra = sa.filter(pl.col("bucket") == bucket)
+        rb = sb.filter(pl.col("bucket") == bucket)
+        if ra.is_empty() or rb.is_empty():
+            continue
+        ra, rb = ra.row(0, named=True), rb.row(0, named=True)
+        fa, fb = ra["flows"], rb["flows"]
+        y_order.append(f"({_human(fa)}→{_human(fb)} flows)  {bucket}")
+        for metric in ("avg", "p95"):
+            bef, aft = ra[metric], rb[metric]
+            d_abs = aft - bef
+            pct = (d_abs / bef * 100) if bef else 0.0
+            good = d_abs < 0
+            lbl = f"{d_abs:+.1f} ({pct:+.1f}%)"
+            lx = (bef * aft) ** 0.5
+            bl = y_order[-1]
+            for phase, value in (("before", bef), ("after", aft)):
+                rows.append({"bucket": bucket, "bucket_label": bl, "metric": metric,
+                             "phase": phase, "value": value,
+                             "before": bef, "after": aft,
+                             "flows_a": fa, "flows_b": fb,
+                             "label": lbl if phase == "after" else None,
+                             "label_x": lx if phase == "after" else None,
+                             "label_color": (GREEN if good else RED)
+                             if phase == "after" else None})
+
+            verb = "down" if pct < 0 else "up"
+            parts.append(f"{bucket} {metric} {verb} {abs(pct):.1f}%")
+
+    long = pd.DataFrame(rows)
+    after_only = alt.datum.phase == "after"
+    y = alt.Y("bucket_label:N", sort=y_order, title="batch size bucket",
+              axis=alt.Axis(labelFontSize=11, titlePadding=8))
+    logx = alt.Scale(type="log")
+
+    rules = alt.Chart(long).transform_filter(after_only).mark_rule(
+        color=GREY, strokeWidth=2).encode(
+        y=y, x=alt.X("before:Q", scale=logx, title=None), x2="after:Q")
+    points = alt.Chart(long).mark_point(filled=True, size=80).encode(
+        y=y, x=alt.X("value:Q", scale=logx),
+        color=alt.Color("phase:N",
+                        scale=alt.Scale(domain=["before", "after"],
+                                        range=[GREY, GREEN]),
+                        legend=alt.Legend(title=None, orient="top")),
+        tooltip=["bucket", "metric", "phase",
+                 alt.Tooltip("flows_a:Q", title="flows_a", format=","),
+                 alt.Tooltip("flows_b:Q", title="flows_b", format=","),
+                 alt.Tooltip("value:Q", format=".1f")])
+    labels = alt.Chart(long).transform_filter(after_only).mark_text(
+        align="center", dy=-10, fontSize=10).encode(
+        y=y, x=alt.X("label_x:Q", scale=logx), text="label:N",
+        color=alt.Color("label_color:N", scale=None),
+    )
+
+    chart = (
+        alt.layer(rules, points, labels)
+           .properties(width=260, height=160)
+           .facet(column=alt.Column("metric:N", sort=["avg", "p95"],
+                                    title=None, header=alt.Header(labelFontSize=13)),
+                  spacing=40)
+           .resolve_scale(x="independent")
+           .properties(title=alt.TitleParams(
+               text=title,
+               subtitle="before (grey) → after (green); (…) = flows_a→flows_b; labels = Δ (Δ%)",
+               subtitleFontSize=10, subtitleColor="#555"))
+    )
+    path = out_dir / filename
+    chart.save(str(path))
+    print(f"  wrote {path}")
+
+
 print(f"before: {before_path}")
 print(f"after:  {after_path}")
 render("per-flow",            "latency-per-flow.svg",
@@ -227,3 +342,8 @@ method_table = (
       .head(top_n)
 )
 render_method(method_table)
+
+render_batch("duration_ms", "latency-batch-per-flow.svg",
+             "Batched per-flow duration: before vs after (ms)")
+render_batch("per_call_ms", "latency-batch-per-call.svg",
+             "Batched per-call amortized: before vs after (ms)")
