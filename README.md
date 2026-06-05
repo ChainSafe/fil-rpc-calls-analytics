@@ -23,14 +23,24 @@ All analysis tasks read `calls.parquet` by default; override with `PARQUET=path 
 | `popular [method] [top_params]` | Most-used methods and their most common params |
 | `errors` | Error rates per method |
 | `compare <before.parquet> <after.parquet>` | Per-method latency diff |
+| `charts <before> <after> [top_n] [out]` | Parquet-only deck (all PNG): reliability, batching, what-node-serves + before/after latency comparisons → `charts/` |
+| `charts-do <before> <after> [out]` | Charts fusing parquet + DigitalOcean (load-over-time with CPU/mem/disk overlay, scalability) → `charts/`; run `fetch-do` first |
+| `fetch-do <parquet>…` | Fetch DigitalOcean metrics aligned to each capture → `do-metrics/` (creds from `.env`: `DIGITALOCEAN_TOKEN` + `DIGITALOCEAN_HOST_ID`) |
 | `peek` | Schema + first rows of the parquet |
 | `install` | Install Python deps (mitmproxy, pyarrow, polars) |
 
-## Benchmarking
+## Charts
 
-`rpc_bench.sh` drives [oha](https://github.com/hatoo/oha) against a Lotus/Forest endpoint with a chosen method/params, after a warm-up. Tweak `METHOD`, `PARAMS`, `LOTUS_URL`, `FOREST_URL` at the top of the script; results land in `results/`.
+Polished charts land in `charts/`, split by the data they need:
 
-## Env knobs
+- **Parquet only** — `mise run charts <before.parquet> <after.parquet>` renders the business deck (`reliability`, `batching`, `what-node-serves`) plus the technical before/after latency comparisons — all PNG. No DigitalOcean data required.
+- **Parquet + DigitalOcean** — `mise run charts-do <before.parquet> <after.parquet>` renders the charts that fuse RPC capture with whole-server resource data: `load-over-time` (RPC demand + CPU/memory/disk + latency on one clock) and `scalability`. Needs `do-metrics/` populated.
 
-- `PARQUET` — input parquet path (default `calls.parquet`).
-- `PARAMS_CAP`, `ERROR_CAP` — column truncation for `slow` (defaults 200/80; set to `0` for no cap).
+Populate `do-metrics/` first (the window is auto-derived from each parquet, so the resource data lines up with the captured traffic):
+
+```sh
+cp .env.example .env        # then set your DigitalOcean creds in .env:
+#   DIGITALOCEAN_TOKEN=dop_v1_...     (a read-only token is enough)
+#   DIGITALOCEAN_HOST_ID=123456789    (the droplet's numeric id, not its name)
+mise run fetch-do <before.parquet> <after.parquet>
+```

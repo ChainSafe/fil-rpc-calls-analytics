@@ -1,0 +1,138 @@
+#!/usr/bin/env python
+#MISE description="Render the parquet+DigitalOcean charts: load-over-time (RPC demand + CPU/mem/disk + latency on one clock) and scalability. Args: <before.parquet> <after.parquet> [out_dir=charts]. Run fetch-do first."
+
+import sys
+from pathlib import Path
+from statistics import mean
+
+# This task lives in mise-tasks/, but the chart toolkit (chart_kit) and the data
+# layers (do_metrics, rpc_queries) live in the repo root. Put the root on sys.path
+# so the imports resolve whether mise runs this file or it's run directly.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import altair as alt
+import pandas as pd
+
+import do_metrics as dm
+import rpc_queries as rq
+from chart_kit import (
+    INK, FAINT, GREEN, BLUE, PURPLE, TEAL, STONE,
+    style, save, per_flow, date_label, over_time_chart,
+)
+
+# Resource charts keep the slightly larger title styling the deck has always used.
+RES = dict(title_size=20, sub_size=13, sub_pad=8)
+
+
+def capture_t0_span(path):
+    """`(t0, span_hours)` for a capture, from its first/last request."""
+    pf = per_flow(path)
+    t0 = float(pf["ts_start"].min())
+    return t0, (float(pf["ts_start"].max()) - t0) / 3600
+
+
+# ============== load + resources + latency over time (folds in resource-peak)
+def load_over_time(path, w):
+    """The single "Forest under real load" timeline: RPC demand, then whole-server
+    CPU / memory / disk (each panel's title carries its avg/peak vs capacity, so
+    the headroom story rides along), then median & p95 response. Folds in the old
+    resource-peak chart — the avg/peak numbers live in the panel titles and disk
+    is scaled to its full 619 GB so its low, flat usage reads as headroom.
+    """
+    pf = per_flow(path)
+    t0 = float(pf["ts_start"].min())
+    t1 = float(pf["ts_start"].max())
+    clip = lambda s: [v for tt, v in s if t0 <= tt <= t1]
+    cpu, mem, disk = clip(dm.cpu_series(w)), clip(dm.mem_series(w)), clip(dm.disk_series(w))
+    total = dm.mem_stats(w)["total"]
+    cores = dm.cpu_stats(w)["cores"]
+    dsize = dm.disk_stats(w)["size"]
+    resources = [
+        {"df": dm.cpu_overlay(w, t0), "field": "cpu", "color": PURPLE,
+         "title": f"server CPU used (%) — {cores} cores · avg {mean(cpu):.0f}% · peak {max(cpu):.0f}%"},
+        {"df": dm.mem_overlay(w, t0), "field": "mem", "color": TEAL,
+         "title": f"server memory used (GB) — of 32 GB · avg {mean(mem):.0f} GB ({100 * mean(mem) / total:.0f}%) "
+                  f"· peak {max(mem):.0f} GB ({100 * max(mem) / total:.0f}%)"},
+        {"df": dm.disk_overlay(w, t0), "field": "disk", "color": STONE, "domain": [0, dsize],
+         "title": f"server disk used (GB) — of {dsize:.0f} GB · DB footprint ~{mean(disk):.0f} GB "
+                  f"({100 * mean(disk) / dsize:.0f}%)"},
+    ]
+    return over_time_chart(path, resources=resources)
+
+
+# ---------------------------------------------------------------- scaling
+def scalability(bp, ap, bw, aw):
+    blbl, albl = "before", "after"
+    rps_b = rq.headline(bp)["req_per_s"]
+    rps_a = rq.headline(ap)["req_per_s"]
+    mem_b = dm.mem_stats(bw)["used_mean"]
+    mem_a = dm.mem_stats(aw)["used_mean"]
+
+    def panel(title, vb, va, fmt, unit, win_color):
+        d = (va - vb) / vb * 100 if vb else 0.0
+        df = pd.DataFrame([{"phase": blbl, "v": vb, "c": FAINT},
+                           {"phase": albl, "v": va, "c": GREEN}])
+        base = alt.Chart(df).encode(
+            x=alt.X("phase:N", sort=[blbl, albl], title=None, axis=alt.Axis(
+                labelFontSize=13, labelFontWeight=600, labelColor=INK, labelAngle=0)),
+            y=alt.Y("v:Q", title=unit, scale=alt.Scale(domain=[0, va * 1.28])))
+        bars = base.mark_bar(size=64, cornerRadius=5).encode(color=alt.Color("c:N", scale=None))
+        vlab = base.mark_text(dy=-9, fontSize=14, fontWeight=600, color=INK).encode(
+            text=alt.Text("v:Q", format=fmt))
+        dlab = alt.Chart(pd.DataFrame({"phase": [albl], "v": [va],
+                                       "t": [f"{'+' if d >= 0 else ''}{d:.0f}%"]})).mark_text(
+            dy=-30, fontSize=17, fontWeight=700, color=win_color).encode(
+            x=alt.X("phase:N", sort=[blbl, albl]), y="v:Q", text="t:N")
+        return (bars + vlab + dlab).properties(width=250, height=300, title=alt.TitleParams(
+            title, fontSize=14, color=INK, anchor="start"))
+
+    p1 = panel("Requests served per second", rps_b, rps_a, ".2f", "req/s", BLUE)
+    p2 = panel("Memory used", mem_b, mem_a, ".1f", "GB", GREEN)
+    chart = alt.hconcat(p1, p2, spacing=70)
+    cpu_a = dm.cpu_stats(aw)["util_mean"]
+    return style(chart, "Traffic doubled. Memory barely moved.",
+                 [f"the node served {rps_a / rps_b:.0f}× the requests for "
+                  f"only ~{(mem_a - mem_b) / mem_b * 100:.0f}% more memory",
+                  f"CPU rose with load but stayed near {cpu_a:.0f}% of the box."], **RES)
+
+
+# ============================================================ render
+if len(sys.argv) < 3:
+    print("usage: mise run charts-do <before.parquet> <after.parquet> [out_dir=charts]",
+          file=sys.stderr)
+    sys.exit(2)
+before_path, after_path = sys.argv[1], sys.argv[2]
+out = Path(sys.argv[3] if len(sys.argv) > 3 else "charts")
+out.mkdir(parents=True, exist_ok=True)
+BEFORE_LBL = date_label(before_path)
+AFTER_LBL = date_label(after_path)
+
+bt0, bspan = capture_t0_span(before_path)
+at0, aspan = capture_t0_span(after_path)
+bw = dm.window_for(bt0, bspan)
+aw = dm.window_for(at0, aspan)
+missing = [f"{Path(p).name} ({lbl})"
+           for p, win, lbl in ((before_path, bw, BEFORE_LBL), (after_path, aw, AFTER_LBL))
+           if win is None]
+if missing:
+    have = ", ".join(dm.windows()) or "none"
+    sys.exit(f"no DigitalOcean window overlaps {' and '.join(missing)} — "
+             f"do-metrics/ has [{have}]. Pick captures that overlap a fetched window "
+             f"(e.g. the may22→may26 baseline), or run `mise run fetch-do <parquet>` first "
+             f"(note: DO metric retention may not reach captures more than ~a month old).")
+
+# Warn (don't fail) if a capture's clock range is only partly spanned by DO
+# samples — measured as covered span / capture span, so it's independent of
+# DO's (range-dependent) sample cadence.
+for tag, p, t0, span, w in [("before", before_path, bt0, bspan, bw),
+                            ("after", after_path, at0, aspan, aw)]:
+    inside = [t for t, _ in dm.cpu_series(w) if t0 <= t <= t0 + span * 3600]
+    cov = (max(inside) - min(inside)) / (span * 3600) if len(inside) > 1 else 0.0
+    if cov < 0.9:
+        print(f"  note: {tag} capture only ~{cov*100:.0f}% spanned by DO window '{w}' "
+              f"(DO metric retention may not reach that far back)", file=sys.stderr)
+
+print(f"before = {BEFORE_LBL} ({bw})   after = {AFTER_LBL} ({aw})   ->  {out}")
+save(load_over_time(after_path, aw), out / "load-over-time.png")
+save(scalability(before_path, after_path, bw, aw), out / "scalability.png")
+print("done")

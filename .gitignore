@@ -3,3 +3,4 @@
 *.mitm
 *.out
 __pycache__/
+.env

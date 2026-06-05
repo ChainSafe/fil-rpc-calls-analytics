@@ -1,25 +1,45 @@
 #!/usr/bin/env python
-#MISE description="Render latency-reduction comparison charts (Altair SVG). Args: <before.parquet> <after.parquet> [top_n=30]. CHARTS_DIR=out."
+#MISE description="Render the parquet-only chart deck (all PNG): business charts (reliability, batching, what-node-serves) + before/after latency comparisons. Args: <before.parquet> <after.parquet> [top_n=30] [out_dir=charts] (or CHARTS_DIR env)."
 
 import os
 import sys
 from pathlib import Path
 
+# This task lives in mise-tasks/, but the chart toolkit (chart_kit) and the
+# data layer (rpc_queries) live in the repo root. Put the root on sys.path so the
+# imports resolve whether mise runs this file or it's run as `python mise-tasks/charts`.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import altair as alt
+import numpy as np
+import pandas as pd
 import polars as pl
+
+import rpc_queries as rq
+from chart_kit import (
+    INK, MUTED, GRID, FAINT, GREEN, RED, TEAL, BLUE, PURPLE, FONT,
+    human, ms, style, save, per_flow, date_label,
+)
 
 
 if len(sys.argv) < 3:
-    print("usage: mise run charts <before.parquet> <after.parquet>", file=sys.stderr)
+    print("usage: mise run charts <before.parquet> <after.parquet> [top_n=30] [out_dir=charts]",
+          file=sys.stderr)
     sys.exit(2)
 
 before_path = sys.argv[1]
 after_path = sys.argv[2]
 top_n = int(sys.argv[3]) if len(sys.argv) > 3 else 30
-out_dir = Path(os.environ.get("CHARTS_DIR", "charts"))
-out_dir.mkdir(exist_ok=True)
+# out_dir: positional arg [4] wins, else CHARTS_DIR env, else "charts"
+out_dir = Path(sys.argv[4] if len(sys.argv) > 4 else os.environ.get("CHARTS_DIR", "charts"))
+out_dir.mkdir(parents=True, exist_ok=True)
+
+BEFORE_LBL = date_label(before_path)
+AFTER_LBL = date_label(after_path)
+GREY = FAINT  # the before/after dumbbells call the muted "before" tone GREY
 
 
+# ============================================================ latency dumbbells (PNG)
 def latencies(path: str) -> dict[str, dict[str, float]]:
     df = pl.scan_parquet(path).filter(pl.col("duration_ms").is_not_null())
     flow = df.unique(subset=["flow_id"])
@@ -47,11 +67,6 @@ for view in ("per-flow", "per-call amortized"):
         rows.append({"view": view, "metric": metric, "phase": "before", "ms": a[view][metric]})
         rows.append({"view": view, "metric": metric, "phase": "after",  "ms": b[view][metric]})
 data = pl.DataFrame(rows).to_pandas()
-
-
-GREEN = "#16a34a"
-GREY  = "#9ca3af"
-RED   = "#dc2626"
 
 
 def render(view: str, filename: str, title: str) -> None:
@@ -108,9 +123,7 @@ def render(view: str, filename: str, title: str) -> None:
     chart = alt.vconcat(bar_chart, delta_chart).properties(
         title=alt.TitleParams(text=title, subtitle=sentence, subtitleFontSize=11, subtitleColor="#555"),
     )
-    path = out_dir / filename
-    chart.save(str(path))
-    print(f"  wrote {path}")
+    save(chart, out_dir / filename)
 
 
 def per_method(path: str) -> pl.DataFrame:
@@ -207,9 +220,7 @@ def render_method(table: pl.DataFrame) -> None:
                subtitle="before (grey) → after (green); calls panel = traffic volume (n_a→n_b); labels = Δ",
                subtitleFontSize=11, subtitleColor="#555"))
     )
-    path = out_dir / "latency-per-method.svg"
-    chart.save(str(path))
-    print(f"  wrote {path}")
+    save(chart, out_dir / "latency-per-method.png")
 
 
 BUCKETS = ["2-10", "11-50", "51-99", "100+"]
@@ -321,16 +332,359 @@ def render_batch(col: str, filename: str, title: str) -> None:
                subtitle="before (grey) → after (green); (…) = flows_a→flows_b; labels = Δ (Δ%)",
                subtitleFontSize=10, subtitleColor="#555"))
     )
-    path = out_dir / filename
-    chart.save(str(path))
-    print(f"  wrote {path}")
+    save(chart, out_dir / filename)
 
 
-print(f"before: {before_path}")
-print(f"after:  {after_path}")
-render("per-flow",            "latency-per-flow.svg",
+# ==================================================== reliability hero (deck opener)
+def reliability_hero():
+    """Bold opener: scale + reliability under real load as two big numbers over a
+    full "answered" bar — not a stat grid. The supporting figures ride in one thin
+    strip underneath so the eye lands on "millions of calls, all answered" first.
+    """
+    head = rq.headline(after_path)
+    lf = pl.scan_parquet(after_path)
+    total = head["calls"]
+    # "answered" = Forest returned a response (a result OR a proper JSON-RPC error);
+    # only a captured request with neither is a genuine no-answer.
+    no_ans = lf.filter(pl.col("result_json").is_null() & pl.col("error_code").is_null()
+                       ).select(pl.len()).collect().item()
+    ans_pct = (total - no_ans) / total * 100
+    ov = rq.overall_latency(after_path)
+    p50, p95 = ov["per-flow"]["p50"], ov["per-flow"]["p95"]
+    total_b = lf.unique(subset=["flow_id"]).select(pl.col("flow_resp_bytes").sum()).collect().item()
+    cps, span_h = head["calls_per_s"], head["span_seconds"] / 3600
+    methods = rq.distinct_methods(after_path)
+    if no_ans == 0:
+        ans_big, ans_sub = "100%", "answered — 0 dropped"
+    elif ans_pct >= 99.95:
+        ans_big, ans_sub = f"{ans_pct:.2f}%", "answered"
+    else:
+        ans_big, ans_sub = f"{ans_pct:.1f}%", f"answered — {human(no_ans)} no-response"
+
+    def t(s, x, y, size, weight, color):
+        return alt.Chart(pd.DataFrame([{"t": s}])).mark_text(
+            align="left", baseline="middle", fontSize=size, fontWeight=weight,
+            color=color, font=FONT).encode(x=alt.value(x), y=alt.value(y), text="t:N")
+
+    def rect(x1, x2, y1, y2, fill, radius=0):
+        return alt.Chart(pd.DataFrame([{"_": 0}])).mark_rect(fill=fill, cornerRadius=radius).encode(
+            x=alt.value(x1), x2=alt.value(x2), y=alt.value(y1), y2=alt.value(y2))
+
+    chips = (f"~{cps:.0f} calls/sec     ·     {span_h:.0f} h sustained     ·     {ms(p50)} typical"
+             f"     ·     {ms(p95)} p95     ·     {methods} methods     ·     {total_b/1e9:.1f} GB served")
+    hero = alt.layer(
+        t(human(total), 60, 82, 80, 800, INK),
+        t("RPC calls served", 64, 138, 17, 600, MUTED),
+        t(ans_big, 600, 82, 80, 800, GREEN),
+        t(ans_sub, 604, 138, 17, 600, MUTED),
+        rect(60, 1080, 172, 196, GRID, 6),
+        rect(60, 60 + 1020 * ans_pct / 100, 172, 196, GREEN, 6),
+        t("every request got a response · real, sustained load", 60, 216, 13, 500, MUTED),
+        t(chips, 60, 243, 14, 600, INK),
+    ).properties(width=1140, height=265)
+    return style(hero, "Forest under real load",
+                 "the scale and reliability of a single Forest node")
+
+
+# ============================ batching: most of the load, far cheaper per call
+def batching_chart():
+    """Two aligned panels by batch size: how many calls each carries (most ride
+    in big batches) and what each call costs (far less in a batch).
+
+    Baseline is eth_call ALONE vs eth_call IN A BATCH — apples to apples, because
+    batches are ~99% eth_call and an eth_call genuinely costs ~41 ms on its own
+    (it executes the EVM). Merges the old batch-scorecard (the 84%-of-calls fact)
+    and batch-savings (the per-call cost), dropping the confounded before/after.
+    """
+    dist = {r["bucket"]: r for r in rq.batch_distribution(after_path).iter_rows(named=True)}
+    total = sum(r["calls"] for r in dist.values())
+    cost = {r["bucket"]: r["mean"] for r in
+            rq.summarise_buckets(rq.batch_flows(after_path), "per_call_ms").iter_rows(named=True)}
+    eth_alone = (pl.scan_parquet(after_path)
+                 .filter((pl.col("batch_size") == 1) & (pl.col("method") == "eth_call"))
+                 .select(pl.col("duration_ms").mean()).collect().item())
+    cost["1"] = eth_alone
+
+    lbls = {"1": "1  (eth_call alone)", "2-10": "2–10", "11-50": "11–50",
+            "51-99": "51–99", "100+": "100+"}
+    keys = ["1", "2-10", "11-50", "51-99", "100+"]
+    rows = []
+    for bk in keys:
+        calls = dist.get(bk, {}).get("calls", 0)
+        c = cost.get(bk)
+        rows.append({"bucket": lbls[bk], "calls": calls, "cost": c,
+                     "vlbl": f"{human(calls)}  ({calls / total * 100:.0f}%)",
+                     "clbl": (f"{c:.0f} ms" if bk == "1"
+                              else f"{c:.1f} ms · {eth_alone / c:.0f}× cheaper" if c else "")})
+    df = pd.DataFrame(rows)
+    order = [lbls[b] for b in keys]
+    y = alt.Y("bucket:N", sort=order, title="calls bundled per request",
+              axis=alt.Axis(labelFontSize=12, ticks=False, domain=False, titlePadding=10))
+
+    vbars = alt.Chart(df).mark_bar(cornerRadiusEnd=4, color=TEAL, height=26).encode(
+        y=y, x=alt.X("calls:Q", title="calls carried", scale=alt.Scale(domain=[0, df["calls"].max() * 1.35]),
+                     axis=alt.Axis(format="~s", grid=False, labels=False, ticks=False)))
+    vtxt = alt.Chart(df).mark_text(align="left", dx=6, fontSize=12, fontWeight=700, color=INK).encode(
+        y=y, x="calls:Q", text="vlbl:N")
+    left = (vbars + vtxt).properties(width=300, height=240, title=alt.TitleParams(
+        text="traffic — calls carried", anchor="start", fontSize=13.5, color=INK, dy=-4))
+
+    cbars = alt.Chart(df).mark_bar(cornerRadiusEnd=4, height=26).encode(
+        y=y, x=alt.X("cost:Q", title="cost per call (ms) · lower is better",
+                     scale=alt.Scale(domain=[0, eth_alone * 1.2])),
+        color=alt.Color("cost:Q", scale=alt.Scale(scheme="greens", reverse=True, domainMax=eth_alone),
+                        legend=None))
+    ctxt = alt.Chart(df).mark_text(align="left", dx=6, fontSize=12, fontWeight=700, color=INK).encode(
+        y=y, x="cost:Q", text="clbl:N")
+    right = (cbars + ctxt).properties(width=340, height=240, title=alt.TitleParams(
+        text="cost per call", anchor="start", fontSize=13.5, color=INK, dy=-4))
+
+    chart = alt.hconcat(left, right, spacing=54)
+    bcalls = sum(dist.get(b, {}).get("calls", 0) for b in keys[1:])
+    breqs = sum(dist.get(b, {}).get("flows", 0) for b in keys[1:])
+    treqs = sum(r["flows"] for r in dist.values())
+    big = cost["100+"]
+    return style(chart, "Batching: most of the load rides in batches — and costs far less per call",
+                 f"batches are {breqs / treqs * 100:.0f}% of requests but carry {bcalls / total * 100:.0f}% of all calls · "
+                 f"an eth_call costs ~{eth_alone:.0f} ms alone but ~{big:.0f} ms in a 100+ batch "
+                 f"({eth_alone / big:.0f}× cheaper), where {dist['100+']['calls'] / total * 100:.0f}% of calls ride")
+
+
+# ===================== what one node serves: traffic, breadth, data served
+def mix_chart():
+    """Three aligned panels by namespace — traffic (calls), breadth (distinct
+    methods) and data (response bytes). Each ranks the namespaces differently
+    (eth dominates traffic, Filecoin has the widest API, trace pushes the most
+    data), so one chart captures what a single Forest node actually serves. Folds
+    in the old data-served chart, now grouped by namespace."""
+    df = (rq.namespace_coverage(after_path)
+            .join(rq.namespace_bytes(after_path), on="namespace", how="left")
+            .with_columns(pl.col("bytes").fill_null(0))
+            .filter(pl.col("namespace") != "other"))
+    total = df["calls"].sum()
+    df = df.with_columns((pl.col("calls") / total * 100).alias("share")).sort("calls", descending=True)
+    order = df["namespace"].to_list()
+    pdf = df.to_pandas()
+    pdf["calls_lbl"] = [f"{human(c)}  ({s:.0f}%)" for c, s in zip(pdf["calls"], pdf["share"])]
+    pdf["bytes_lbl"] = [f"{b/1e9:.2f} GB" if b >= 1e9 else f"{b/1e6:.0f} MB" if b >= 1e6
+                        else f"{b/1e3:.0f} KB" if b > 0 else "—" for b in pdf["bytes"]]
+
+    def panel(field, lbl_field, title, color, fmt, pad):
+        base = alt.Chart(pdf).encode(y=alt.Y("namespace:N", sort=order, title=None,
+                                             axis=alt.Axis(labelFontSize=12, ticks=False, domain=False)))
+        bars = base.mark_bar(cornerRadiusEnd=4, height=22, color=color).encode(
+            x=alt.X(f"{field}:Q", title=title, scale=alt.Scale(domain=[0, pdf[field].max() * pad]),
+                    axis=alt.Axis(format=fmt, grid=False, labels=False, ticks=False)))
+        txt = base.mark_text(align="left", dx=6, fontSize=12, fontWeight=700, color=INK).encode(
+            x=f"{field}:Q", text=f"{lbl_field}:N" if lbl_field else alt.Text(f"{field}:Q", format=fmt))
+        return (bars + txt).properties(width=250, height=210, title=alt.TitleParams(
+            text=title, anchor="start", fontSize=13.5, color=INK, dy=-4))
+
+    p_calls = panel("calls", "calls_lbl", "traffic — calls served", TEAL, "~s", 1.5)
+    p_methods = panel("methods", None, "API surface — methods", BLUE, "d", 1.25)
+    p_bytes = panel("bytes", "bytes_lbl", "data — response bytes", PURPLE, "~s", 1.5)
+    chart = alt.hconcat(p_calls, p_methods, p_bytes, spacing=40)
+    n = rq.distinct_methods(after_path)
+    total_b = float(df["bytes"].sum())
+    eth_share = float(pdf.loc[pdf.namespace == "eth", "share"].sum()) if (pdf.namespace == "eth").any() else 0.0
+    top_data = pdf.sort_values("bytes", ascending=False).iloc[0]["namespace"]
+    return style(chart, f"What one Forest node serves — {n} methods across {len(order)} namespaces",
+                 f"eth is ~{eth_share:.0f}% of the traffic · Filecoin is the widest API · "
+                 f"{top_data} pushes most of the {total_b/1e9:.1f} GB served")
+
+
+# ===== appendix pool — defined but NOT rendered (kept available, off the deck) =====
+def cdf_chart():
+    qs = np.concatenate([np.linspace(0.01, 0.98, 80), np.linspace(0.981, 0.999, 20)])
+    before_lbl, after_lbl = f"{BEFORE_LBL} (before)", f"{AFTER_LBL} (after)"
+    rows, marks = [], []
+    for label, path, color in [(before_lbl, before_path, FAINT),
+                               (after_lbl, after_path, GREEN)]:
+        s = per_flow(path)["duration_ms"]
+        for q in qs:
+            rows.append({"phase": label, "pctile": q * 100,
+                         "ms": float(s.quantile(q)), "color": color})
+        for q, nm in ((0.5, "median"), (0.95, "p95")):
+            v = float(s.quantile(q))
+            marks.append({"phase": label, "pctile": q * 100, "ms": v, "color": color,
+                          "lbl": f"{nm} {v:.0f} ms" if v >= 10 else f"{nm} {v:.1f} ms"})
+    df, mdf = pd.DataFrame(rows), pd.DataFrame(marks)
+
+    X = alt.X("ms:Q", scale=alt.Scale(type="log", domain=[1, 2000]),
+              title="response time (ms) · lower is better", axis=alt.Axis(format="~s"))
+    Y = alt.Y("pctile:Q", title="% of requests answered this fast or faster",
+              scale=alt.Scale(domain=[0, 100]))
+    cscale = alt.Scale(domain=[before_lbl, after_lbl], range=[FAINT, GREEN])
+
+    refs = alt.Chart(pd.DataFrame([{"y": 50, "t": "median"}, {"y": 95, "t": "95th %ile"}]))
+    ref_lines = refs.mark_rule(color=GRID, strokeDash=[4, 4]).encode(y="y:Q")
+    ref_text = refs.mark_text(align="left", dx=3, dy=-5, color=MUTED, fontSize=10.5).encode(
+        y="y:Q", x=alt.value(2), text="t:N")
+    line = alt.Chart(df).mark_line(strokeWidth=2.5).encode(
+        x=X, y=Y, order="pctile:Q",
+        color=alt.Color("phase:N", scale=cscale, legend=alt.Legend(title=None, orient="bottom-right")))
+    dots = alt.Chart(mdf).mark_point(filled=True, size=80, stroke="white", strokeWidth=1).encode(
+        x=X, y=Y, color=alt.Color("phase:N", scale=cscale, legend=None))
+    # after (faster) sits left of before, so label after to its left and before to its right
+    lbl_after = alt.Chart(mdf[mdf.phase == after_lbl]).mark_text(
+        align="right", dx=-8, fontSize=11, fontWeight=700).encode(
+        x=X, y=Y, text="lbl:N", color=alt.Color("color:N", scale=None, legend=None))
+    lbl_before = alt.Chart(mdf[mdf.phase == before_lbl]).mark_text(
+        align="left", dx=8, fontSize=11, fontWeight=700).encode(
+        x=X, y=Y, text="lbl:N", color=alt.Color("color:N", scale=None, legend=None))
+
+    chart = (ref_lines + ref_text + line + dots + lbl_after + lbl_before).properties(width=720, height=400)
+    p95a = mdf[(mdf.phase == after_lbl) & (mdf.pctile == 95)]["ms"].iloc[0]
+    p95b = mdf[(mdf.phase == before_lbl) & (mdf.pctile == 95)]["ms"].iloc[0]
+    return style(chart, "How fast are requests answered?",
+                 f"read “95% of requests answered within X ms”: {p95b:.0f} ms → {p95a:.0f} ms · "
+                 "after-curve further left = faster")
+
+
+def scorecard_chart():
+    """Top methods as a shaded table: traffic, mean & p95 before→after, coloured
+    by how much each moved (green faster, red slower). Reads like a leaderboard.
+
+    Methods with too few requests in the *before* capture to compare reliably
+    (e.g. trace_block had only 12) are left grey and marked, never coloured as a
+    win or loss off a noisy baseline.
+    """
+    MIN_N = 100  # below this, the earlier capture's baseline is statistical noise
+    cols = ("n", "mean", "p95")
+    a = rq.singleton_per_method(before_path).select("method", *cols).rename({c: f"{c}_a" for c in cols})
+    b = rq.singleton_per_method(after_path).select("method", *cols).rename({c: f"{c}_b" for c in cols})
+    top = rq.top_singleton_methods(after_path, 10)
+    t = (b.join(a, on="method", how="left")
+          .filter(pl.col("method").is_in(top) & pl.col("mean_a").is_not_null()))
+    # preserve top-by-after-volume order
+    t = t.with_columns(pl.col("method").replace_strict({m: i for i, m in enumerate(top)},
+                       default=999).alias("_o")).sort("_o")
+
+    COL = {"mean": "mean (ms)", "p95": "p95 (ms)"}
+    rows, order, any_low = [], [], False
+    for r in t.iter_rows(named=True):
+        n_a = r["n_a"]
+        low = n_a is not None and n_a < MIN_N
+        any_low = any_low or low
+        m = r["method"] + ("  *" if low else "")
+        order.append(m)
+        rows.append({"m": m, "col": "traffic", "kind": "neutral",
+                     "big": human(r["n_b"]), "small": "requests", "chg": 0.0})
+        for key in ("mean", "p95"):
+            bef, aft = r[f"{key}_a"], r[f"{key}_b"]
+            d = (aft - bef) / bef * 100 if bef else 0.0
+            if low:
+                rows.append({"m": m, "col": COL[key], "kind": "neutral",
+                             "big": f"{bef:.0f} → {aft:.0f}", "small": f"only {int(n_a)} before",
+                             "chg": 0.0})
+            else:
+                small = "≈ same" if abs(d) < 3 else f"{'+' if d > 0 else '−'}{abs(d):.0f}%"
+                rows.append({"m": m, "col": COL[key], "kind": "metric",
+                             "big": f"{bef:.0f} → {aft:.0f}", "small": small,
+                             "chg": max(-50, min(50, d))})
+    df = pd.DataFrame(rows)
+    xcols = ["traffic", "mean (ms)", "p95 (ms)"]
+
+    y = alt.Y("m:N", sort=order, title=None,
+              axis=alt.Axis(labelFontSize=12, labelLimit=300, ticks=False, domain=False))
+    x = alt.X("col:N", sort=xcols, title=None,
+              axis=alt.Axis(orient="top", labelFontSize=12.5, labelFontWeight=700,
+                            labelColor=INK, ticks=False, domain=False, labelPadding=8))
+    neutral, metric = df[df.kind == "neutral"], df[df.kind == "metric"]
+    # green (faster) ← white → red (slower); grey for un-comparable cells
+    ncell = alt.Chart(neutral).mark_rect(stroke="white", strokeWidth=3, fill="#f1f5f9").encode(x=x, y=y)
+    mcell = alt.Chart(metric).mark_rect(stroke="white", strokeWidth=3).encode(
+        x=x, y=y, color=alt.Color("chg:Q",
+            scale=alt.Scale(domain=[-50, 0, 50], range=["#86efac", "#ffffff", "#fca5a5"]),
+            legend=None))
+    big = alt.Chart(df).mark_text(dy=-7, fontSize=12.5, fontWeight=700, color=INK).encode(
+        x=x, y=y, text="big:N")
+    small = alt.Chart(df).mark_text(dy=10, fontSize=10.5, color=MUTED).encode(
+        x=x, y=y, text="small:N")
+    chart = (ncell + mcell + big + small).properties(width=360, height=42 * len(order))
+    sub = (f"before → after on {BEFORE_LBL} vs {AFTER_LBL} · green = faster, red = slower "
+           "(shaded by how much) · singletons only")
+    if any_low:
+        sub += " · * too few requests before to compare"
+    return style(chart, "Top methods — traffic, speed, and how each moved", sub)
+
+
+def bandwidth_chart():
+    """How much response data Forest pushed, and which methods are heaviest."""
+    df = pl.scan_parquet(after_path)
+    total = df.unique(subset=["flow_id"]).select(pl.col("flow_resp_bytes").sum()).collect().item()
+    bym = (df.filter(pl.col("batch_size") == 1).group_by("method")
+             .agg(pl.col("flow_resp_bytes").sum().alias("bytes"))
+             .sort("bytes", descending=True).head(8).collect().to_pandas())
+    bym["lbl"] = bym["bytes"].map(lambda b: f"{b/1e9:.2f} GB" if b >= 1e9 else f"{b/1e6:.0f} MB")
+    y = alt.Y("method:N", sort="-x", title=None, axis=alt.Axis(labelFontSize=12))
+    bars = alt.Chart(bym).mark_bar(cornerRadiusEnd=4, color=TEAL, height=22).encode(
+        y=y, x=alt.X("bytes:Q", title="response bytes served (singletons)", axis=alt.Axis(format="~s")))
+    lbl = alt.Chart(bym).mark_text(align="left", dx=6, fontSize=11.5, fontWeight=700, color=INK).encode(
+        y=y, x="bytes:Q", text="lbl:N")
+    chart = (bars + lbl).properties(width=600, height=300)
+    top1 = bym.iloc[0]["method"]
+    return style(chart, f"Data served — {total/1e9:.1f} GB of responses in {AFTER_LBL}",
+                 f"heaviest singleton methods by total bytes returned · {top1} alone is most of it")
+
+
+def load_latency_chart():
+    df = per_flow(after_path)
+    t0 = df["ts_start"].min()
+    g = (df.with_columns((((pl.col("ts_start") - t0) / 600).floor()).alias("bin"))
+           .group_by("bin").agg(pl.col("batch_size").sum().alias("calls"),
+                                pl.col("duration_ms").quantile(0.95).alias("p95"))
+           .with_columns((pl.col("calls") / 600).alias("calls_s")).to_pandas())
+    pts = alt.Chart(g).mark_point(filled=True, size=70, color=TEAL, opacity=0.65).encode(
+        x=alt.X("calls_s:Q", title="load — RPC calls / sec (each dot = a 10-min window)",
+                scale=alt.Scale(zero=False)),
+        y=alt.Y("p95:Q", title="p95 response time (ms)", scale=alt.Scale(zero=True)))
+    trend = pts.transform_regression("calls_s", "p95").mark_line(color=RED, strokeWidth=2)
+    chart = (pts + trend).properties(width=640, height=360)
+    return style(chart, "Does Forest slow down under load?",
+                 "p95 vs throughput across the capture · a flat red trend = latency holds as load rises")
+
+
+def error_chart():
+    df = pl.scan_parquet(after_path)
+    total = df.select(pl.len()).collect().item()
+    success = df.filter(pl.col("result_json").is_not_null()).select(pl.len()).collect().item()
+    errs = df.filter(pl.col("error_code").is_not_null())
+    revert = errs.filter(
+        pl.col("method").is_in(["eth_call", "eth_estimateGas", "eth_createAccessList"])
+        | pl.col("error_message").str.contains("execution failed|failed to apply|revert").fill_null(False)
+    ).select(pl.len()).collect().item()
+    err_total = errs.select(pl.len()).collect().item()
+    other_err = err_total - revert
+    no_ans = total - success - err_total
+    cats = [("answered — result returned", success, GREEN),
+            ("contract revert — caller's tx reverts, returned correctly", revert, FAINT),
+            ("genuine RPC error", other_err, RED),
+            ("no answer", max(no_ans, 0), "#d1d5db")]
+    rows = [{"cat": c, "calls": n, "color": col, "pctval": n / total * 100,
+             "lbl": f"{human(n)}  ({n/total*100:.1f}%)"} for c, n, col in cats if n > 0]
+    df2 = pd.DataFrame(rows)
+    order = [r["cat"] for r in rows]
+    y = alt.Y("cat:N", sort=order, title=None, axis=alt.Axis(labelLimit=420, labelFontSize=12))
+    bars = alt.Chart(df2).mark_bar(cornerRadiusEnd=4, height=30).encode(
+        y=y, x=alt.X("calls:Q", title="calls", axis=alt.Axis(format="~s")),
+        color=alt.Color("color:N", scale=None, legend=None))
+    lbl = alt.Chart(df2).mark_text(align="left", dx=6, fontSize=12, fontWeight=700, color=INK).encode(
+        y=y, x="calls:Q", text="lbl:N")
+    chart = (bars + lbl).properties(width=620, height=44 * len(rows))
+    return style(chart, "The honest error rate isn’t 80% — it’s a fraction of a percent",
+                 f"most “errors” are eth_call contract reverts Forest returns correctly · "
+                 f"genuine failures = {other_err/total*100:.1f}% · {AFTER_LBL}")
+
+
+# ============================================================ render the deck
+print(f"before: {before_path} ({BEFORE_LBL})")
+print(f"after:  {after_path} ({AFTER_LBL})")
+
+# before/after latency-comparison dumbbells (PNG)
+render("per-flow",            "latency-per-flow.png",
        "Per-flow latency: before vs after (ms)")
-render("per-call amortized",  "latency-per-call.svg",
+render("per-call amortized",  "latency-per-call.png",
        "Per-call amortized latency: before vs after (ms)")
 
 qcols = ("n", "mean", "p95")
@@ -343,7 +697,13 @@ method_table = (
 )
 render_method(method_table)
 
-render_batch("duration_ms", "latency-batch-per-flow.svg",
+render_batch("duration_ms", "latency-batch-per-flow.png",
              "Batched per-flow duration: before vs after (ms)")
-render_batch("per_call_ms", "latency-batch-per-call.svg",
+render_batch("per_call_ms", "latency-batch-per-call.png",
              "Batched per-call amortized: before vs after (ms)")
+
+# single-capture business deck (PNG, from the AFTER parquet)
+save(reliability_hero(), out_dir / "reliability.png")
+save(batching_chart(),   out_dir / "batching.png")
+save(mix_chart(),        out_dir / "what-node-serves.png")
+print("done")
