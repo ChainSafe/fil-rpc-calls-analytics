@@ -2,4 +2,6 @@
 *.parquet
 *.mitm
 *.out
+*.mitm.zst
+*.parquet.zst
 __pycache__/

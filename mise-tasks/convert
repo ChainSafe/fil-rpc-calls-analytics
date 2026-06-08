@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-#MISE description="Convert <input.mitm> (default flows.mitm) -> calls*.parquet. Set BAN_IPS=ip1,ip2 to exclude flows."
+#MISE description="Convert <input.mitm|.mitm.zst> (default flows.mitm) -> calls*.parquet. Set BAN_IPS=ip1,ip2 to exclude flows, JOBS=N for worker count."
 #MISE depends=["install"]
 set -euo pipefail
 
 input="${1:-flows.mitm}"
 output="${input/flows/calls}"
+output="${output%.zst}"
 output="${output%.mitm}.parquet"
 
-python flows_to_parquet.py "$input" "$output" --ban-ips "${BAN_IPS:-}"
+python flows_to_parquet.py "$input" "$output" \
+    --ban-ips "${BAN_IPS:-}" \
+    ${JOBS:+--jobs "$JOBS"}
