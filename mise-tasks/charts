@@ -52,21 +52,24 @@ data = pl.DataFrame(rows).to_pandas()
 GREEN = "#16a34a"
 GREY  = "#9ca3af"
 RED   = "#dc2626"
+BLUE  = "#2563eb"
 
 
 def render(view: str, filename: str, title: str) -> None:
-    sub = data[data["view"] == view]
-    # delta % per metric ((after - before) / before)
-    deltas = []
-    sentence_parts = []
+    sub = data[data["view"] == view].copy()
+    deltas, sentence_parts, after_fill = [], [], {}
     for metric in ("avg", "p95", "p99"):
-        before_ms = sub[(sub.metric == metric) & (sub.phase == "before")]["ms"].iloc[0]
-        after_ms  = sub[(sub.metric == metric) & (sub.phase == "after")]["ms"].iloc[0]
+        before_ms = sub.loc[(sub.metric == metric) & (sub.phase == "before"), "ms"].iloc[0]
+        after_ms  = sub.loc[(sub.metric == metric) & (sub.phase == "after"), "ms"].iloc[0]
         d = (after_ms - before_ms) / before_ms * 100 if before_ms else 0.0
+        after_fill[metric] = GREEN if after_ms < before_ms else RED if after_ms > before_ms else GREY
         verb = "down" if d < 0 else "up"
-        deltas.append({"metric": metric, "label": f"{d:+.1f}%"})
+        deltas.append({"metric": metric, "label": f"{d:+.1f}%", "fill": after_fill[metric]})
         sentence_parts.append(f"{metric} {verb} {abs(d):.1f}% ({before_ms:.1f} → {after_ms:.1f} ms)")
+    sub["fill"] = sub.apply(
+        lambda r: GREY if r.phase == "before" else after_fill[r.metric], axis=1)
     delta_df = __import__("pandas").DataFrame(deltas)
+    fill_scale = alt.Scale(domain=[GREEN, RED, GREY], range=[GREEN, RED, GREY])
 
     base = alt.Chart(sub).encode(
         x=alt.X("phase:N", sort=["before", "after"], title=None,
@@ -75,10 +78,9 @@ def render(view: str, filename: str, title: str) -> None:
         y=alt.Y("ms:Q", title="latency (ms)"),
     )
     bars = base.mark_bar(size=42).encode(
-        color=alt.Color("phase:N",
-                        scale=alt.Scale(domain=["before", "after"],
-                                        range=[GREY, GREEN]),
-                        legend=None),
+        color=alt.condition(
+            alt.datum.phase == "before", alt.value(GREY),
+            alt.Color("fill:N", scale=fill_scale, legend=None)),
         tooltip=["metric", "phase", alt.Tooltip("ms:Q", format=".1f")],
     )
     labels = base.mark_text(dy=-6, fontSize=11).encode(
@@ -95,8 +97,8 @@ def render(view: str, filename: str, title: str) -> None:
     # Delta percentage row, faceted so it aligns under each metric panel.
     delta_chart = (
         alt.Chart(delta_df)
-           .mark_text(fontSize=15, fontWeight="bold", color=GREEN)
-           .encode(text=alt.Text("label:N"))
+           .mark_text(fontSize=15, fontWeight="bold")
+           .encode(text=alt.Text("label:N"), color=alt.Color("fill:N", scale=None))
            .properties(width=170, height=24)
            .facet(column=alt.Column("metric:N", sort=["avg", "p95", "p99"],
                                     title=None, header=alt.Header(labels=False)),
@@ -146,8 +148,10 @@ def render_method(table: pl.DataFrame) -> None:
 
     # Log axes can't plot null/zero, so keep methods present in both runs. A
     # method with a latency in both files also has n_a > 0 and n_b > 0.
-    base = table.filter(
-        pl.col("mean_a").is_not_null() & pl.col("mean_b").is_not_null()
+    base = (
+        table.filter(pl.col("mean_a").is_not_null() & pl.col("mean_b").is_not_null())
+              .with_columns(pl.max_horizontal("n_a", "n_b").alias("_calls"))
+              .sort("_calls", descending=True)
     )
     order = base["method"].to_list()
 
@@ -166,10 +170,13 @@ def render_method(table: pl.DataFrame) -> None:
             d = aft - bef
             label = (f"{'+' if d >= 0 else '-'}{_human(abs(d))}"
                      if kind == "count" else f"{d:+.1f}")
+            fill = (BLUE if kind == "count" else
+                    GREEN if aft < bef else RED if aft > bef else GREY)
             for phase, value in (("before", bef), ("after", aft)):
                 rows.append({"method": r["method"], "panel": panel,
                              "phase": phase, "value": value,
-                             "before": bef, "after": aft, "label": label})
+                             "before": bef, "after": aft, "label": label,
+                             "fill": fill})
 
     long = pd.DataFrame(rows)
 
@@ -182,17 +189,19 @@ def render_method(table: pl.DataFrame) -> None:
         color=GREY, strokeWidth=2).encode(
         y=y, x=alt.X("before:Q", scale=logx, title=None), x2="after:Q",
     )
+    fill_scale = alt.Scale(
+        domain=[GREEN, RED, GREY, BLUE], range=[GREEN, RED, GREY, BLUE])
     points = alt.Chart(long).mark_point(filled=True, size=80).encode(
         y=y, x=alt.X("value:Q", scale=logx, title=None),
-        color=alt.Color("phase:N",
-                        scale=alt.Scale(domain=["before", "after"],
-                                        range=[GREY, GREEN]),
-                        legend=alt.Legend(title=None, orient="top")),
+        color=alt.condition(
+            alt.datum.phase == "before", alt.value(GREY),
+            alt.Color("fill:N", scale=fill_scale, legend=None)),
         tooltip=["method", "panel", "phase", alt.Tooltip("value:Q", format=",.1f")],
     )
     labels = alt.Chart(long).transform_filter(after_only).mark_text(
-        align="center", dy=-10, fontSize=9, color="#374151").encode(
+        align="center", dy=-10, fontSize=9).encode(
         y=y, x=alt.X("after:Q", scale=logx), text="label:N",
+        color=alt.Color("fill:N", scale=None),
     )
 
     chart = (
@@ -202,9 +211,10 @@ def render_method(table: pl.DataFrame) -> None:
                                     title=None, header=alt.Header(labelFontSize=13)),
                   spacing=46)
            .resolve_scale(x="independent")
+           .configure_legend(disable=True)
            .properties(title=alt.TitleParams(
                text=f"Per-method latency: before vs after (top {top_n} by calls)",
-               subtitle="before (grey) → after (green); calls panel = traffic volume (n_a→n_b); labels = Δ",
+               subtitle="calls panel = traffic volume (n_a→n_b); labels = Δ",
                subtitleFontSize=11, subtitleColor="#555"))
     )
     path = out_dir / "latency-per-method.svg"
@@ -267,7 +277,7 @@ def render_batch(col: str, filename: str, title: str) -> None:
             bef, aft = ra[metric], rb[metric]
             d_abs = aft - bef
             pct = (d_abs / bef * 100) if bef else 0.0
-            good = d_abs < 0
+            fill = GREEN if aft < bef else RED if aft > bef else GREY
             lbl = f"{d_abs:+.1f} ({pct:+.1f}%)"
             lx = (bef * aft) ** 0.5
             bl = y_order[-1]
@@ -278,8 +288,7 @@ def render_batch(col: str, filename: str, title: str) -> None:
                              "flows_a": fa, "flows_b": fb,
                              "label": lbl if phase == "after" else None,
                              "label_x": lx if phase == "after" else None,
-                             "label_color": (GREEN if good else RED)
-                             if phase == "after" else None})
+                             "fill": fill})
 
             verb = "down" if pct < 0 else "up"
             parts.append(f"{bucket} {metric} {verb} {abs(pct):.1f}%")
@@ -293,12 +302,12 @@ def render_batch(col: str, filename: str, title: str) -> None:
     rules = alt.Chart(long).transform_filter(after_only).mark_rule(
         color=GREY, strokeWidth=2).encode(
         y=y, x=alt.X("before:Q", scale=logx, title=None), x2="after:Q")
+    fill_scale = alt.Scale(domain=[GREEN, RED, GREY], range=[GREEN, RED, GREY])
     points = alt.Chart(long).mark_point(filled=True, size=80).encode(
         y=y, x=alt.X("value:Q", scale=logx),
-        color=alt.Color("phase:N",
-                        scale=alt.Scale(domain=["before", "after"],
-                                        range=[GREY, GREEN]),
-                        legend=alt.Legend(title=None, orient="top")),
+        color=alt.condition(
+            alt.datum.phase == "before", alt.value(GREY),
+            alt.Color("fill:N", scale=fill_scale, legend=None)),
         tooltip=["bucket", "metric", "phase",
                  alt.Tooltip("flows_a:Q", title="flows_a", format=","),
                  alt.Tooltip("flows_b:Q", title="flows_b", format=","),
@@ -306,7 +315,7 @@ def render_batch(col: str, filename: str, title: str) -> None:
     labels = alt.Chart(long).transform_filter(after_only).mark_text(
         align="center", dy=-10, fontSize=10).encode(
         y=y, x=alt.X("label_x:Q", scale=logx), text="label:N",
-        color=alt.Color("label_color:N", scale=None),
+        color=alt.Color("fill:N", scale=None),
     )
 
     chart = (
@@ -316,9 +325,10 @@ def render_batch(col: str, filename: str, title: str) -> None:
                                     title=None, header=alt.Header(labelFontSize=13)),
                   spacing=40)
            .resolve_scale(x="independent")
+           .configure_legend(disable=True)
            .properties(title=alt.TitleParams(
                text=title,
-               subtitle="before (grey) → after (green); (…) = flows_a→flows_b; labels = Δ (Δ%)",
+               subtitle="(…) = flows_a→flows_b; labels = Δ (Δ%)",
                subtitleFontSize=10, subtitleColor="#555"))
     )
     path = out_dir / filename
