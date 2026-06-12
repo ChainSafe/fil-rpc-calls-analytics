@@ -1,0 +1,18 @@
+name: tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # Installs the tools pinned in mise.toml (Python 3.13 + uv) so CI matches
+      # local dev exactly; `mise run test` then installs deps and runs pytest.
+      - uses: jdx/mise-action@v4
+        with:
+          cache: true
+      - run: mise run test
