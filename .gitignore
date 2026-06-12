@@ -5,3 +5,4 @@
 *.mitm.zst
 *.parquet.zst
 __pycache__/
+.env
