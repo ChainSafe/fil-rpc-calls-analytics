@@ -82,6 +82,17 @@ def colour_vs_load(before, after, load_pct, *, flat=3.0):
     return GREEN if ratio <= 0.5 else (AMBER if ratio <= 1.0 else RED)
 
 
+def node_legend(domain, after_color, *, field="node_label"):
+    """Two-entry node colour legend shared by the before/after bar + dumbbell charts:
+    the before node (`domain[0]`) is the grey baseline, the after node (`domain[1]`)
+    takes `after_color` (green if it improved, red if it regressed). `field` is the
+    data column holding the labels (agent + version), so the legend dots read
+    "Lotus v… ● · Forest v… ●"."""
+    return alt.Color(f"{field}:N", sort=domain,
+                     scale=alt.Scale(domain=domain, range=[FAINT, after_color]),
+                     legend=alt.Legend(title=None, orient="bottom"))
+
+
 def date_label(path):
     """Human date window from the data: 'May 25', 'May 25–26', 'May 12–14'."""
     ts = pl.scan_parquet(path).select(pl.col("ts_start").min().alias("a"),
@@ -126,7 +137,7 @@ def per_flow(path):
 
 
 # ===== shared timeline builder: parquet demand/latency + optional DO resource panels
-def over_time_chart(path, resources=None):
+def over_time_chart(path, resources=None, node="the node"):
     """Stacked timeline panels sharing one clock: RPC demand, then (optionally)
     whole-server resource panels supplied by the caller, then median response.
 
@@ -179,6 +190,6 @@ def over_time_chart(path, resources=None):
     sub = (f"client demand, whole-server CPU / memory / disk, and typical response — same {span:.0f}-hour "
            f"clock · ~{avg_cps:.0f} calls/sec at ~{med_typ:.0f} ms typical"
            if resources else
-           f"sustained for {span:.0f} hours · Forest answered ~{avg_cps:.0f} RPC calls/sec "
+           f"sustained for {span:.0f} hours · {node} answered ~{avg_cps:.0f} RPC calls/sec "
            f"at ~{med_typ:.0f} ms typical")
-    return style(chart, "Forest under real load", sub)
+    return style(chart, f"{node} under real load", sub)

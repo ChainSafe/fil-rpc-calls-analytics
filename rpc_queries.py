@@ -11,6 +11,8 @@ Tasks live in `mise-tasks/`; they put the repo root on `sys.path` and
 
 from __future__ import annotations
 
+import json
+
 import polars as pl
 
 # Batch-size buckets used everywhere (singletons are handled separately).
@@ -248,3 +250,54 @@ def namespace_bytes(path: str) -> pl.DataFrame:
 
 def distinct_methods(path: str) -> int:
     return pl.scan_parquet(path).select(pl.col("method").n_unique()).collect().item()
+
+
+def node_identity(path: str) -> dict:
+    """Identify the node behind a capture (agent + version + commit) from the data.
+
+    Both nodes answer `Filecoin.Version` with `{Agent, Version}`, where `Version`
+    carries the semver plus build metadata after a "+" — the git commit as
+    "…+git.<sha>", e.g. "0.33.6+git.8602bfd8". We keep the semver, lift the commit
+    out separately, and drop the rest. Falls back to `web3_clientVersion`
+    ("forest/0.33.6+git.…"). Returns `{agent, version, commit, label}` so a chart can
+    self-label exactly which builds it compares — no hand-typing.
+    """
+    lf = pl.scan_parquet(path)
+    agent = version = None
+
+    # Prefer Filecoin.Version: a clean object carrying Agent + Version.
+    r = (lf.filter((pl.col("method") == "Filecoin.Version") & pl.col("result_json").is_not_null())
+           .select("result_json").head(1).collect())
+    if len(r):
+        try:
+            v = json.loads(r["result_json"][0])
+            agent, version = v.get("Agent"), v.get("Version")
+        except (ValueError, TypeError):
+            pass
+
+    # Fall back to web3_clientVersion: a JSON string like "forest/0.33.6+git.<sha>".
+    if not version:
+        r = (lf.filter((pl.col("method") == "web3_clientVersion") & pl.col("result_json").is_not_null())
+               .select("result_json").head(1).collect())
+        if len(r) and r["result_json"][0]:
+            try:
+                s = json.loads(r["result_json"][0])
+            except (ValueError, TypeError):
+                s = r["result_json"][0]
+            agent, _, version = s.partition("/") if "/" in s else (agent, "", s)
+
+    version = version or "unknown"
+    # Lift the git commit out of the build metadata, then keep the semver only:
+    # everything from the first "+" is build metadata (a network tag plus the git
+    # commit, "…+git.<sha>") — drop it so the label is a clean, neutral version tag.
+    commit = ""
+    if "+git." in version:
+        commit = version.partition("+git.")[2].split("+")[0]
+    version = version.split("+")[0]
+    if version[:1].isdigit():          # normalise to a v-tag: forest "0.33.6" -> "v0.33.6"
+        version = "v" + version
+    agent_name = (agent or "node").capitalize()
+    # `commit` stays in the dict (for disambiguating same-agent builds) but is
+    # intentionally NOT in the chart-facing `label` — charts show agent + version only.
+    return {"agent": agent_name, "version": version, "commit": commit,
+            "label": f"{agent_name} {version}"}

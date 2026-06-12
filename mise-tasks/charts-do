@@ -1,9 +1,9 @@
 #!/usr/bin/env python
-#MISE description="Render the parquet + server-resource charts: load-over-time (RPC demand + CPU/mem/disk + response on one clock) and scalability. Args: <before.parquet> <after.parquet> [out_dir=charts]. Run fetch-do first."
+#MISE description="Render the parquet + server-resource charts: per-node load-over-time (RPC demand + CPU/mem/disk + response) and a node-vs-node resource head-to-head (CPU/mem/disk, leaner node greens). Args: <node-a.parquet> <node-b.parquet> [out_dir=charts]. Run fetch-do first."
 
 import sys
 from pathlib import Path
-from statistics import mean
+from statistics import mean, median
 
 # This task lives in mise-tasks/, but the chart toolkit (chart_kit) and the data
 # layers (do_metrics, rpc_queries) live in the repo root. Put the root on sys.path
@@ -16,9 +16,9 @@ import pandas as pd
 import do_metrics as dm
 import rpc_queries as rq
 from chart_kit import (
-    INK, FAINT, PURPLE, TEAL, STONE,
+    INK, FAINT, GREEN, RED, PURPLE, TEAL, STONE,
     style, save, per_flow, date_label, over_time_chart,
-    colour_higher_better, colour_vs_load, pct_change,
+    colour_lower_better, node_legend,
 )
 
 # Resource charts keep the slightly larger title styling the deck has always used.
@@ -33,8 +33,8 @@ def parquet_span(path):
 
 
 # ============== load + resources + latency over time (folds in resource-peak)
-def load_over_time(path, w):
-    """The single "Forest under real load" timeline: RPC demand, then whole-server
+def load_over_time(path, w, node):
+    """One node's "under real load" timeline: RPC demand, then whole-server
     CPU / memory / disk (each panel's title carries its avg/peak vs capacity, so
     the headroom story rides along), then median response. Folds in the old
     resource-peak chart — the avg/peak numbers live in the panel titles and disk
@@ -58,51 +58,53 @@ def load_over_time(path, w):
          "title": f"server disk used (GB) — of {dsize:.0f} GB · DB footprint ~{mean(disk):.0f} GB "
                   f"({100 * mean(disk) / dsize:.0f}%)"},
     ]
-    return over_time_chart(path, resources=resources)
+    return over_time_chart(path, resources=resources, node=node)
 
 
-# ---------------------------------------------------------------- scaling
-def scalability(bp, ap, bw, aw):
-    blbl, albl = "before", "after"
-    rps_b = rq.headline(bp)["req_per_s"]
-    rps_a = rq.headline(ap)["req_per_s"]
-    mem_b = dm.mem_stats(bw)["used_mean"]
-    mem_a = dm.mem_stats(aw)["used_mean"]
-    load_pct = pct_change(rps_b, rps_a)
-    mem_pct = pct_change(mem_b, mem_a)
+# --------------------------------- resource footprint (before-node baseline vs after-node)
+def resource_compare(bp, ap, bw, aw):
+    """Whole-server footprint at comparable load. The before node (A) is the grey
+    baseline; the after node (B) carries the verdict colour — green when it runs
+    leaner (less CPU / memory / disk for the same work), red when heavier. The move
+    sits under each panel and the headline sums it up; builds self-label from the
+    data via node_identity."""
+    rps_a, rps_b = rq.headline(bp)["req_per_s"], rq.headline(ap)["req_per_s"]
+    metrics = [  # (title, unit, fmt, A value, B value) — lower is leaner
+        ("CPU used", "% of box", ".0f",
+         dm.cpu_stats(bw)["util_mean"], dm.cpu_stats(aw)["util_mean"]),
+        ("Memory used", "GB", ".1f",
+         dm.mem_stats(bw)["used_mean"], dm.mem_stats(aw)["used_mean"]),
+        ("Disk (DB footprint)", "GB", ".0f",
+         dm.disk_stats(bw)["used_mean"], dm.disk_stats(aw)["used_mean"]),
+    ]
+    # One verdict colour for the after node, from the median move across the three
+    # resources — green if it runs leaner overall (lower is better for all three).
+    moves = [((vb - va) / va * 100 if va else 0.0) for _, _, _, va, vb in metrics]
+    after_color = GREEN if median(moves) < 0 else RED if median(moves) > 0 else FAINT
 
-    # Per-metric honest-colour policy (chart_kit): throughput is higher-better,
-    # memory is a cost that must grow sub-linearly vs the load to count as a win —
-    # so a low before-baseline can't fake a green.
-    rps_color = colour_higher_better(rps_b, rps_a)
-    mem_color = colour_vs_load(mem_b, mem_a, load_pct)
-
-    def panel(title, vb, va, fmt, unit, good_color):
-        d = (va - vb) / vb * 100 if vb else 0.0
-        df = pd.DataFrame([{"phase": blbl, "v": vb, "c": FAINT},
-                           {"phase": albl, "v": va, "c": good_color}])
+    def panel(title, unit, fmt, va, vb):
+        d = (vb - va) / va * 100 if va else 0.0
+        df = pd.DataFrame([{"node": A_LBL, "node_label": A_FULL, "v": va},
+                           {"node": B_LBL, "node_label": B_FULL, "v": vb}])
         base = alt.Chart(df).encode(
-            x=alt.X("phase:N", sort=[blbl, albl], title=None, axis=alt.Axis(
+            x=alt.X("node:N", sort=[A_LBL, B_LBL], title=None, axis=alt.Axis(
                 labelFontSize=13, labelFontWeight=600, labelColor=INK, labelAngle=0)),
-            y=alt.Y("v:Q", title=unit, scale=alt.Scale(domain=[0, va * 1.28])))
-        bars = base.mark_bar(size=64, cornerRadius=5).encode(color=alt.Color("c:N", scale=None))
+            y=alt.Y("v:Q", title=unit, scale=alt.Scale(domain=[0, max(va, vb) * 1.28])))
+        bars = base.mark_bar(size=64, cornerRadius=5).encode(
+            color=node_legend([A_FULL, B_FULL], after_color))
         vlab = base.mark_text(dy=-9, fontSize=14, fontWeight=600, color=INK).encode(
             text=alt.Text("v:Q", format=fmt))
-        dlab = alt.Chart(pd.DataFrame({"phase": [albl], "v": [va],
-                                       "t": [f"{'+' if d >= 0 else ''}{d:.0f}%"]})).mark_text(
-            dy=-30, fontSize=17, fontWeight=700, color=good_color).encode(
-            x=alt.X("phase:N", sort=[blbl, albl]), y="v:Q", text="t:N")
-        return (bars + vlab + dlab).properties(width=250, height=300, title=alt.TitleParams(
-            title, fontSize=14, color=INK, anchor="start"))
+        return (bars + vlab).properties(width=220, height=300, title=alt.TitleParams(
+            title, subtitle=f"{'down' if d < 0 else 'up'} {abs(d):.0f}%", fontSize=14,
+            color=INK, anchor="start", subtitleColor=colour_lower_better(va, vb),
+            subtitleFontSize=12.5, subtitleFontWeight=700))
 
-    p1 = panel("Requests served per second", rps_b, rps_a, ".2f", "req/s", rps_color)
-    p2 = panel("Memory used", mem_b, mem_a, ".1f", "GB", mem_color)
-    chart = alt.hconcat(p1, p2, spacing=70)
-    cpu_a = dm.cpu_stats(aw)["util_mean"]
-    return style(chart, "Traffic doubled. Memory barely moved.",
-                 [f"the node served {rps_a / rps_b:.0f}× the requests for "
-                  f"only ~{mem_pct:.0f}% more memory",
-                  f"CPU rose with load but stayed near {cpu_a:.0f}% of the box."], **RES)
+    chart = alt.hconcat(*[panel(*m) for m in metrics], spacing=46).resolve_scale(color="shared")
+    parts = [f"{title.split()[0].lower()} {'down' if d < 0 else 'up'} {abs(d):.0f}%"
+             for (title, *_), d in zip(metrics, moves)]
+    return style(chart, f"Resource footprint — {A_LBL} vs {B_LBL} at comparable load",
+                 f"Improvement: {', '.join(parts)} — measured at {rps_a:.0f} vs {rps_b:.0f} req/s.",
+                 **RES)
 
 
 # ============================================================ render
@@ -141,7 +143,15 @@ for tag, p, t0, span, w in [("before", before_path, bt0, bspan, bw),
         print(f"  note: {tag} run only ~{cov*100:.0f}% spanned by server-metrics window '{w}' "
               f"(metric retention may not reach that far back)", file=sys.stderr)
 
-print(f"before = {BEFORE_LBL} ({bw})   after = {AFTER_LBL} ({aw})   ->  {out}")
-save(load_over_time(after_path, aw), out / "load-over-time.png")
-save(scalability(before_path, after_path, bw, aw), out / "scalability.png")
+A = rq.node_identity(before_path)
+B = rq.node_identity(after_path)
+A_LBL, B_LBL = A["agent"], B["agent"]
+if A_LBL == B_LBL:                        # same agent (two builds) -> disambiguate by commit
+    A_LBL, B_LBL = f"{A['agent']} {A['commit'][:7]}", f"{B['agent']} {B['commit'][:7]}"
+A_FULL, B_FULL = A["label"], B["label"]   # agent + version, for the node colour legend
+
+print(f"A = {A['label']} ({bw})   B = {B['label']} ({aw})   ->  {out}")
+save(load_over_time(before_path, bw, A_LBL), out / f"load-over-time-{A_LBL.lower().split()[0]}.png")
+save(load_over_time(after_path,  aw, B_LBL), out / f"load-over-time-{B_LBL.lower().split()[0]}.png")
+save(resource_compare(before_path, after_path, bw, aw), out / "resource-compare.png")
 print("done")
