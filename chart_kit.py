@@ -48,9 +48,10 @@ def ms(x):
 # Each metric decides what "better" means its OWN way, so colour is never a
 # blanket up=good / down=good rule. These return a colour only — the caller
 # writes its own label. GREEN = good · AMBER = borderline · RED = worse ·
-# FAINT = ≈ (no real change). `flat` is the dead-band % under which a move
-# counts as "no change". Pick the helper that matches the metric's semantics.
-NEUTRAL = BLUE   # volume / descriptive: not a win or a loss, just a magnitude
+# NEUTRAL (blue) = ≈ statistical tie (a move inside the `flat` dead-band %).
+# Ties are blue, not FAINT: faint grey vanished against the grey baseline
+# node, so a tie looked like "nothing" instead of "a fact worth reading".
+NEUTRAL = BLUE   # tie / descriptive: not a win or a loss, just a fact
 
 
 def pct_change(before, after):
@@ -60,13 +61,13 @@ def pct_change(before, after):
 def colour_lower_better(before, after, *, flat=3.0):
     """latency, error rate, …: green when it fell, red when it rose."""
     d = pct_change(before, after)
-    return FAINT if abs(d) < flat else (GREEN if d < 0 else RED)
+    return NEUTRAL if abs(d) < flat else (GREEN if d < 0 else RED)
 
 
 def colour_higher_better(before, after, *, flat=3.0):
     """throughput, reliability, calls served, …: green when it rose."""
     d = pct_change(before, after)
-    return FAINT if abs(d) < flat else (GREEN if d > 0 else RED)
+    return NEUTRAL if abs(d) < flat else (GREEN if d > 0 else RED)
 
 
 def colour_vs_load(before, after, load_pct, *, flat=3.0):

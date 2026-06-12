@@ -39,9 +39,9 @@ def singleton_per_method(path: str) -> pl.DataFrame:
           .agg(
               pl.len().alias("n"),
               pl.col("duration_ms").mean().alias("mean"),
-              pl.col("duration_ms").quantile(0.5).alias("p50"),
-              pl.col("duration_ms").quantile(0.95).alias("p95"),
-              pl.col("duration_ms").quantile(0.99).alias("p99"),
+              pl.col("duration_ms").quantile(0.5, interpolation="linear").alias("p50"),
+              pl.col("duration_ms").quantile(0.95, interpolation="linear").alias("p95"),
+              pl.col("duration_ms").quantile(0.99, interpolation="linear").alias("p99"),
               pl.col("duration_ms").max().alias("max"),
           )
           .collect()
@@ -61,8 +61,8 @@ def singleton_overall(path: str) -> dict[str, float]:
           .select(
               pl.len().alias("n"),
               pl.col("duration_ms").mean().alias("mean"),
-              pl.col("duration_ms").quantile(0.5).alias("p50"),
-              pl.col("duration_ms").quantile(0.95).alias("p95"),
+              pl.col("duration_ms").quantile(0.5, interpolation="linear").alias("p50"),
+              pl.col("duration_ms").quantile(0.95, interpolation="linear").alias("p95"),
           )
           .collect()
           .row(0, named=True)
@@ -107,9 +107,9 @@ def summarise_buckets(flows: pl.DataFrame, col: str) -> pl.DataFrame:
              .agg(
                  pl.len().alias("flows"),
                  pl.col(col).mean().alias("mean"),
-                 pl.col(col).quantile(0.5).alias("p50"),
-                 pl.col(col).quantile(0.95).alias("p95"),
-                 pl.col(col).quantile(0.99).alias("p99"),
+                 pl.col(col).quantile(0.5, interpolation="linear").alias("p50"),
+                 pl.col(col).quantile(0.95, interpolation="linear").alias("p95"),
+                 pl.col(col).quantile(0.99, interpolation="linear").alias("p99"),
              )
     )
 
@@ -121,17 +121,17 @@ def overall_latency(path: str) -> dict[str, dict[str, float]]:
     flow = (
         df.unique(subset=["flow_id"]).select(
             pl.col("duration_ms").mean().alias("avg"),
-            pl.col("duration_ms").quantile(0.5).alias("p50"),
-            pl.col("duration_ms").quantile(0.95).alias("p95"),
-            pl.col("duration_ms").quantile(0.99).alias("p99"),
+            pl.col("duration_ms").quantile(0.5, interpolation="linear").alias("p50"),
+            pl.col("duration_ms").quantile(0.95, interpolation="linear").alias("p95"),
+            pl.col("duration_ms").quantile(0.99, interpolation="linear").alias("p99"),
         ).collect().row(0, named=True)
     )
     call = (
         df.with_columns((pl.col("duration_ms") / pl.col("batch_size")).alias("per_call_ms")).select(
             pl.col("per_call_ms").mean().alias("avg"),
-            pl.col("per_call_ms").quantile(0.5).alias("p50"),
-            pl.col("per_call_ms").quantile(0.95).alias("p95"),
-            pl.col("per_call_ms").quantile(0.99).alias("p99"),
+            pl.col("per_call_ms").quantile(0.5, interpolation="linear").alias("p50"),
+            pl.col("per_call_ms").quantile(0.95, interpolation="linear").alias("p95"),
+            pl.col("per_call_ms").quantile(0.99, interpolation="linear").alias("p99"),
         ).collect().row(0, named=True)
     )
     return {"per-flow": flow, "per-call amortized": call}

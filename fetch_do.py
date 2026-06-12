@@ -66,6 +66,8 @@ def capture_window(parquet: str, pad: int) -> tuple[int, int]:
     ts = (pl.scan_parquet(parquet)
             .select(pl.col("ts_start").min().alias("a"), pl.col("ts_start").max().alias("b"))
             .collect())
+    if ts["a"][0] is None or ts["b"][0] is None:
+        sys.exit(f"{parquet}: no ts_start values — is this an RPC-calls parquet?")
     return int(ts["a"][0]) - pad, int(ts["b"][0]) + pad
 
 
@@ -153,6 +155,9 @@ def main():
         ap.error("no token: set DIGITALOCEAN_TOKEN (e.g. in .env) or pass --token (read-only is enough)")
     if not host:
         ap.error("no droplet id: set DIGITALOCEAN_HOST_ID (e.g. in .env) or pass --host")
+    for parquet in args.parquets:
+        if not Path(parquet).is_file():
+            ap.error(f"parquet not found: {parquet}")
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)

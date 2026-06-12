@@ -17,19 +17,24 @@ import polars as pl
 
 import rpc_queries as rq
 from chart_kit import (
-    INK, MUTED, GRID, FAINT, GREEN, RED, TEAL, BLUE, FONT, NEUTRAL,
+    INK, MUTED, GRID, FAINT, GREEN, RED, TEAL, FONT, NEUTRAL,
     human, ms, style, save, per_flow, date_label, colour_lower_better, node_legend,
 )
 
 
+USAGE = "usage: mise run charts <node-a.parquet> <node-b.parquet> [top_n=30] [out_dir=charts]"
 if len(sys.argv) < 3:
-    print("usage: mise run charts <before.parquet> <after.parquet> [top_n=30] [out_dir=charts]",
-          file=sys.stderr)
-    sys.exit(2)
+    sys.exit(USAGE)
 
 before_path = sys.argv[1]
 after_path = sys.argv[2]
-top_n = int(sys.argv[3]) if len(sys.argv) > 3 else 30
+for p in (before_path, after_path):
+    if not Path(p).is_file():
+        sys.exit(f"parquet not found: {p}\n{USAGE}")
+try:
+    top_n = int(sys.argv[3]) if len(sys.argv) > 3 else 30
+except ValueError:
+    sys.exit(f"top_n must be a number, got {sys.argv[3]!r}\n{USAGE}")
 # out_dir: positional arg [4] wins, else CHARTS_DIR env, else "charts"
 out_dir = Path(sys.argv[4] if len(sys.argv) > 4 else os.environ.get("CHARTS_DIR", "charts"))
 out_dir.mkdir(parents=True, exist_ok=True)
@@ -50,6 +55,10 @@ GREY = FAINT  # the muted "before" baseline tone (the after node carries the ver
 
 
 # ============================================================ latency dumbbells (PNG)
+# All percentiles use LINEAR interpolation (the numpy/pandas/duckdb default) —
+# polars' default "nearest" can land a whole sample-step off on these clumpy
+# latency distributions (Lotus 100+ batch p50: 3033 vs the true 2777.5 ms),
+# and a number a reviewer can't reproduce is a number they won't trust.
 METRICS = ("avg", "p50", "p95", "p99")
 
 # Fixed round y-caps per panel (user-tuned for the deck): clean axes, and the
@@ -65,17 +74,17 @@ def latencies(path: str) -> dict[str, dict[str, float]]:
     flow = df.unique(subset=["flow_id"])
     f = flow.select(
         pl.col("duration_ms").mean().alias("avg"),
-        pl.col("duration_ms").quantile(0.5).alias("p50"),
-        pl.col("duration_ms").quantile(0.95).alias("p95"),
-        pl.col("duration_ms").quantile(0.99).alias("p99"),
+        pl.col("duration_ms").quantile(0.5, interpolation="linear").alias("p50"),
+        pl.col("duration_ms").quantile(0.95, interpolation="linear").alias("p95"),
+        pl.col("duration_ms").quantile(0.99, interpolation="linear").alias("p99"),
     ).collect().row(0, named=True)
     c = df.with_columns(
         (pl.col("duration_ms") / pl.col("batch_size")).alias("per_call_ms")
     ).select(
         pl.col("per_call_ms").mean().alias("avg"),
-        pl.col("per_call_ms").quantile(0.5).alias("p50"),
-        pl.col("per_call_ms").quantile(0.95).alias("p95"),
-        pl.col("per_call_ms").quantile(0.99).alias("p99"),
+        pl.col("per_call_ms").quantile(0.5, interpolation="linear").alias("p50"),
+        pl.col("per_call_ms").quantile(0.95, interpolation="linear").alias("p95"),
+        pl.col("per_call_ms").quantile(0.99, interpolation="linear").alias("p99"),
     ).collect().row(0, named=True)
     return {"per-flow": f, "per-call amortized": c}
 
@@ -93,13 +102,18 @@ for view in ("per-flow", "per-call amortized"):
 data = pl.DataFrame(rows).to_pandas()
 
 
-def _delta_label(a_ms: float, b_ms: float) -> str:
+def _delta_label(a_ms: float, b_ms: float, *, tie: bool = False) -> str:
     """The gap between the two bars in real time units — '560 ms faster',
-    '6.3 ms slower', '13.5 s faster' — absolute, never a % (reviewer rule)."""
+    '6.3 ms slower', '13.5 s faster' — absolute, never a % (reviewer rule).
+    `tie` (the caller derives it from the colour dead band, keeping one source
+    of truth) renders as '≈ even (57 ms)' so the words can't claim a win the
+    colour just called a coin-flip."""
     d = b_ms - a_ms
     mag = abs(d)
     txt = (f"{mag / 1000:.1f} s" if mag >= 1000
            else f"{mag:.0f} ms" if mag >= 10 else f"{mag:.1f} ms")
+    if tie:
+        return f"≈ even ({txt})"
     return f"{txt} {'faster' if d < 0 else 'slower'}"
 
 
@@ -118,8 +132,9 @@ def render(view: str, filename: str, title: str) -> None:
         a_ms = sub[(sub.metric == metric) & (sub.phase == A_LBL)]["ms"].iloc[0]
         b_ms = sub[(sub.metric == metric) & (sub.phase == B_LBL)]["ms"].iloc[0]
         d_values.append((b_ms - a_ms) / a_ms * 100 if a_ms else 0.0)
-        deltas[metric] = {"label": _delta_label(a_ms, b_ms),
-                          "colour": colour_lower_better(a_ms, b_ms)}
+        col = colour_lower_better(a_ms, b_ms)
+        deltas[metric] = {"label": _delta_label(a_ms, b_ms, tie=col == NEUTRAL),
+                          "colour": col}
     overall = float(np.median(d_values)) if d_values else 0.0
     after_color = GREEN if overall < 0 else RED if overall > 0 else FAINT
 
@@ -168,7 +183,7 @@ def per_method(path: str) -> pl.DataFrame:
           .agg(
               pl.len().alias("n"),
               pl.col("duration_ms").mean().alias("mean"),
-              pl.col("duration_ms").quantile(0.95).alias("p95"),
+              pl.col("duration_ms").quantile(0.95, interpolation="linear").alias("p95"),
           )
           .collect()
     )
@@ -303,20 +318,22 @@ def batch_summary(path: str, col: str) -> pl.DataFrame:
           .agg(
               pl.len().alias("flows"),
               pl.col(col).mean().alias("avg"),
-              pl.col(col).quantile(0.95).alias("p95"),
+              pl.col(col).quantile(0.5, interpolation="linear").alias("p50"),
+              pl.col(col).quantile(0.95, interpolation="linear").alias("p95"),
           )
     )
 
 
 def render_batch(col: str, filename: str, title: str) -> None:
-    """Horizontal dumbbells: bucket on y, latency on x (avg and p95). The before
-    node (A) is the grey baseline; the after node (B) carries the verdict colour."""
+    """Horizontal dumbbells: bucket on y, latency on x (avg, p50 and p95). The
+    before node (A) is the grey baseline; the after node (B) carries the verdict
+    colour. Each rule's label is the gap in real time units ("3.1 s faster"),
+    never a % (reviewer rule)."""
     import pandas as pd
 
     sa = batch_summary(before_path, col)
     sb = batch_summary(after_path, col)
     rows, y_order, deltas = [], [], []
-    metric_pcts = {"avg": [], "p95": []}
     for bucket in BUCKETS:
         ra = sa.filter(pl.col("bucket") == bucket)
         rb = sb.filter(pl.col("bucket") == bucket)
@@ -325,16 +342,13 @@ def render_batch(col: str, filename: str, title: str) -> None:
         ra, rb = ra.row(0, named=True), rb.row(0, named=True)
         fa, fb = ra["flows"], rb["flows"]
         y_order.append(f"({_human(fa)}→{_human(fb)} flows)  {bucket}")
-        for metric in ("avg", "p95"):
+        for metric in ("avg", "p50", "p95"):
             bef, aft = ra[metric], rb[metric]
-            d_abs = aft - bef
-            pct = (d_abs / bef * 100) if bef else 0.0
-            deltas.append(d_abs)
-            metric_pcts[metric].append(pct)
-            lbl = f"{d_abs:+.1f} ({pct:+.1f}%)"
+            deltas.append(aft - bef)
+            label_fill = colour_lower_better(bef, aft)  # per-bucket Δ colour
+            lbl = _delta_label(bef, aft, tie=label_fill == NEUTRAL)
             lx = (bef * aft) ** 0.5
             bl = y_order[-1]
-            label_fill = colour_lower_better(bef, aft)  # per-bucket Δ colour
             for phase, value, node_full in ((A_LBL, bef, A_FULL), (B_LBL, aft, B_FULL)):
                 rows.append({"bucket": bucket, "bucket_label": bl, "metric": metric,
                              "phase": phase, "value": value,
@@ -344,15 +358,6 @@ def render_batch(col: str, filename: str, title: str) -> None:
                              "label": lbl if phase == B_LBL else None,
                              "label_x": lx if phase == B_LBL else None,
                              "label_color": label_fill if phase == B_LBL else None})
-
-    summary = []
-    for metric in ("avg", "p95"):
-        vals = metric_pcts[metric]
-        if not vals:
-            continue
-        m = float(np.median(vals))
-        verb = "down" if m < 0 else "up"
-        summary.append(f"{metric} {verb} {abs(m):.1f}%")
 
     long = pd.DataFrame(rows)
     overall = float(np.median(deltas)) if deltas else 0.0
@@ -381,13 +386,13 @@ def render_batch(col: str, filename: str, title: str) -> None:
     chart = (
         alt.layer(rules, points, labels)
            .properties(width=260, height=160)
-           .facet(column=alt.Column("metric:N", sort=["avg", "p95"],
+           .facet(column=alt.Column("metric:N", sort=["avg", "p50", "p95"],
                                     title=None, header=alt.Header(labelFontSize=13)),
                   spacing=40)
            .resolve_scale(x="independent")
            .properties(title=alt.TitleParams(
                text=title,
-               subtitle="Improvement: " + ", ".join(summary) + " (median across buckets).",
+               subtitle="lower is better · batched requests only, by batch size · log scale",
                subtitleFontSize=10, subtitleColor="#555"))
     )
     save(chart, out_dir / filename)
@@ -479,7 +484,7 @@ def batching_chart():
     y = alt.Y("bucket:N", sort=order, title="calls bundled per request",
               axis=alt.Axis(labelFontSize=12, ticks=False, domain=False, titlePadding=10))
 
-    vbars = alt.Chart(df).mark_bar(cornerRadiusEnd=4, color=TEAL, height=26).encode(
+    vbars = alt.Chart(df).mark_bar(cornerRadiusEnd=4, color=GREEN, height=26).encode(
         y=y, x=alt.X("calls:Q", title=None, scale=alt.Scale(domain=[0, df["calls"].max() * 1.35]),
                      axis=alt.Axis(format="~s", grid=False, labels=False, ticks=False)))
     vtxt = alt.Chart(df).mark_text(align="left", dx=6, fontSize=12, fontWeight=700, color=INK).encode(
@@ -534,8 +539,8 @@ def mix_chart():
         return (bars + txt).properties(width=250, height=210, title=alt.TitleParams(
             text=title, anchor="start", fontSize=13.5, color=INK, dy=-4))
 
-    p_calls = panel("calls", "calls_lbl", "calls served", TEAL, "~s", 1.5)
-    p_methods = panel("methods", None, "API surface — methods", BLUE, "d", 1.25)
+    p_calls = panel("calls", "calls_lbl", "calls served", GREEN, "~s", 1.5)
+    p_methods = panel("methods", None, "API surface — methods", GREEN, "d", 1.25)
     chart = alt.hconcat(p_calls, p_methods, spacing=40)
     n = rq.distinct_methods(after_path)
     eth_share = float(pdf.loc[pdf.namespace == "eth", "share"].sum()) if (pdf.namespace == "eth").any() else 0.0
@@ -553,9 +558,9 @@ def cdf_chart():
         s = per_flow(path)["duration_ms"]
         for q in qs:
             rows.append({"phase": label, "pctile": q * 100,
-                         "ms": float(s.quantile(q)), "color": color})
+                         "ms": float(s.quantile(q, interpolation="linear")), "color": color})
         for q, nm in ((0.5, "median"), (0.95, "p95")):
-            v = float(s.quantile(q))
+            v = float(s.quantile(q, interpolation="linear"))
             marks.append({"phase": label, "pctile": q * 100, "ms": v, "color": color,
                           "lbl": f"{nm} {v:.0f} ms" if v >= 10 else f"{nm} {v:.1f} ms"})
     df, mdf = pd.DataFrame(rows), pd.DataFrame(marks)
@@ -683,7 +688,7 @@ def load_latency_chart():
     t0 = df["ts_start"].min()
     g = (df.with_columns((((pl.col("ts_start") - t0) / 600).floor()).alias("bin"))
            .group_by("bin").agg(pl.col("batch_size").sum().alias("calls"),
-                                pl.col("duration_ms").quantile(0.95).alias("p95"))
+                                pl.col("duration_ms").quantile(0.95, interpolation="linear").alias("p95"))
            .with_columns((pl.col("calls") / 600).alias("calls_s")).to_pandas())
     pts = alt.Chart(g).mark_point(filled=True, size=70, color=TEAL, opacity=0.65).encode(
         x=alt.X("calls_s:Q", title="load — RPC calls / sec (each dot = a 10-min window)",

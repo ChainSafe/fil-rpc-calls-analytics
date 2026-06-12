@@ -23,17 +23,17 @@ All analysis tasks read `calls.parquet` by default; override with `PARQUET=path 
 | `popular [method] [top_params]` | Most-used methods and their most common params |
 | `errors` | Error rates per method |
 | `compare <before.parquet> <after.parquet>` | Per-method latency diff |
-| `charts <before> <after> [top_n] [out]` | Parquet-only deck (all PNG): reliability, batching, what-node-serves + before/after latency comparisons → `charts/` |
-| `charts-do <before> <after> [out]` | Charts fusing parquet + DigitalOcean (load-over-time with CPU/mem/disk overlay, scalability) → `charts/`; run `fetch-do` first |
+| `charts <node-a> <node-b> [top_n] [out]` | Parquet-only deck (all PNG): reliability, batching, what-node-serves + node-vs-node latency comparisons (per-flow, per-call, per-method, batched) → `charts/` |
+| `charts-do <node-a> <node-b> [out]` | Parquet + DigitalOcean: `load-over-time` — both nodes' server CPU/memory on one clock → `charts/`; run `fetch-do` first |
 | `fetch-do <parquet>…` | Fetch DigitalOcean metrics aligned to each capture → `do-metrics/` (creds from `.env`: `DIGITALOCEAN_TOKEN` + `DIGITALOCEAN_HOST_ID`) |
 | `peek` | Schema + first rows of the parquet |
-| `install` | Install Python deps (mitmproxy, pyarrow, polars) |
+| `install` | Install all Python deps (mitmproxy, polars, altair, vl-convert, …) |
 
 ## Charts
 
 Polished charts land in `charts/`, split by the data they need:
 
-- **Parquet only** — `mise run charts <before.parquet> <after.parquet>` renders the business deck (`reliability`, `batching`, `what-node-serves`) plus the technical before/after latency comparisons — all PNG. No DigitalOcean data required.
+- **Parquet only** — `mise run charts <node-a.parquet> <node-b.parquet>` renders the business deck (`reliability`, `batching`, `what-node-serves`) plus the node-vs-node latency comparisons (charts self-label from the data via `Filecoin.Version`, e.g. "Forest v0.33.6 vs Lotus v1.36.1-dev") — all PNG. No DigitalOcean data required.
 - **Parquet + DigitalOcean** — `mise run charts-do <node-a.parquet> <node-b.parquet>` renders `load-over-time`: both nodes' whole-server CPU and memory overlaid on one clock, over the same observation window (trimmed to the shorter run). Needs `do-metrics/` populated.
 
 Populate `do-metrics/` first (the window is auto-derived from each parquet, so the resource data lines up with the captured traffic):
