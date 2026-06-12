@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+#MISE description="Capture-health check for a mitm dump: flags POST flows whose request body wasn't stored. Usage: healthcheck <input.mitm|.mitm.zst>. Set JOBS=N."
+#MISE depends=["install"]
+set -euo pipefail
+
+input="${1:-flows.mitm}"
+
+python flows_healthcheck.py "$input" ${JOBS:+--jobs "$JOBS"}

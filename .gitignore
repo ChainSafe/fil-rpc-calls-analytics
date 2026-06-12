@@ -2,6 +2,9 @@
 *.parquet
 *.mitm
 *.out
-*.mitm.zst
-*.parquet.zst
+*.zst
+*.pcap
+*.pcap.gz
+captures/
+metrics.txt
 __pycache__/

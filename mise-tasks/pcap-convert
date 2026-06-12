@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+#MISE description="Convert a tcpdump pcap or a .tar.zst of pcaps (HTTP/1.1 JSON-RPC) to a single calls*.parquet. Usage: pcap-convert <in.pcap|in.tar.zst> [out.parquet]. Set PORT=<captured server port> (required), BAN_IPS=, COMPRESSION=, MAX_DURATION_MS= (null implausibly-long latencies; 0 disables; default 60000)."
+#MISE depends=["install"]
+set -euo pipefail
+
+input="${1:?usage: pcap-convert <in.pcap|in.tar.zst> [out.parquet]  (set PORT=<captured server port>)}"
+output="${2:-}"
+if [[ -z "$output" ]]; then
+    base="$(basename "$input")"
+    base="${base%.pcap}"
+    base="${base%.tar.zst}"
+    base="${base%.tzst}"
+    output="calls-${base}.parquet"
+fi
+
+python pcap_to_parquet.py "$input" "$output" \
+    --port "${PORT:?set PORT to the captured server port, e.g. PORT=3456}" \
+    --ban-ips "${BAN_IPS:-}" \
+    --compression "${COMPRESSION:-zstd}" \
+    --max-duration-ms "${MAX_DURATION_MS:-60000}"

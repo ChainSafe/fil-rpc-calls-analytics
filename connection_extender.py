@@ -30,7 +30,7 @@ mitmdump --mode reverse:http://127.0.0.1:1234/ \
          -s connection_extender.py \
          --set upstream_url=http://127.0.0.1:1234 \
          --set upstream_timeout=60 \
-         --set banned_ips=1.2.3.4
+         --set banned_ips=10.0.0.1
 ```
 """
 

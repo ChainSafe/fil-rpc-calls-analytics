@@ -107,18 +107,24 @@ def _process_flow(flow_id: int, flow) -> list[dict]:
 
     req = flow.request
     resp = flow.response
-    host = req.host
-    path = req.path
-    ts_start = req.timestamp_start
-    ts_end = resp.timestamp_end if resp else None
-    http_status = resp.status_code if resp else None
-
     req_text = _decode(req.raw_content or b"", req.headers.get("content-encoding", ""))
     resp_text = _decode(
         (resp.raw_content or b"") if resp else b"",
         resp.headers.get("content-encoding", "") if resp else "",
     )
+    return build_rows(
+        flow_id, req.host, req.path, req.timestamp_start,
+        resp.timestamp_end if resp else None,
+        resp.status_code if resp else None,
+        req_text, resp_text,
+    )
 
+
+def build_rows(flow_id: int, host: str, path: str, ts_start, ts_end, http_status,
+               req_text: str, resp_text: str) -> list[dict]:
+    """Turn one HTTP request/response (already decoded to text) into per-JSON-RPC-call
+    rows matching SCHEMA. Shared by the mitm-dump and pcap conversion paths so both
+    produce byte-identical columns."""
     try:
         req_obj = json.loads(req_text)
     except Exception:

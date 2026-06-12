@@ -141,3 +141,54 @@ def test_ban_ips_excludes_flow(mitm, tmp_path):
     methods = sorted(r["method"] for r in _rows(out))
     assert "getHealth" not in methods
     assert methods == ["getBalance", "getBlock", "getBlock", "getSlot"]
+
+
+def _make_aborted_flow(client_ip="10.0.0.9"):
+    """A fire-and-forget POST: declares a Content-Length but the body never
+    arrived and there's no response (resp=False) — an expected abort."""
+    f = tflow.tflow(resp=False)
+    f.request.method = "POST"
+    f.request.path = "/rpc/v1"
+    f.request.headers["content-type"] = "application/json"
+    f.request.headers["content-length"] = "66"
+    f.request.raw_content = b""
+    f.client_conn.peername = (client_ip, 12345)
+    return f
+
+
+def _make_capture_gap_flow(client_ip="10.0.0.8"):
+    """A POST recorded as a complete flow (response present, no error) but with
+    an empty request body — the signature of a real capture/streaming gap."""
+    f = tflow.tflow(resp=True)
+    f.request.method = "POST"
+    f.request.path = "/rpc/v1"
+    f.request.headers["content-type"] = "application/json"
+    f.request.headers["content-length"] = "66"
+    f.request.raw_content = b""
+    f.client_conn.peername = (client_ip, 12345)
+    return f
+
+
+def test_healthcheck_classifies_delivery(tmp_path):
+    import io as _io
+    from collections import Counter
+
+    import flows_healthcheck as hc
+    from flows_to_parquet import _frame
+
+    # 4 delivered RPC flows + 3 aborted + 1 capture-gap
+    flows = (_sample_flows()
+             + [_make_aborted_flow() for _ in range(3)]
+             + [_make_capture_gap_flow()])
+    buf = _io.BytesIO()
+    w = FlowWriter(buf)
+    for f in flows:
+        w.add(f)
+    buf.seek(0)
+
+    chunk = list(enumerate(_frame(buf)))
+    totals: Counter = hc._classify_chunk(chunk)
+
+    assert totals["class", "delivered"] == 4
+    assert totals["class", "aborted"] == 3
+    assert totals["class", "capture_gap"] == 1

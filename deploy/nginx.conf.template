@@ -1,0 +1,47 @@
+# nginx front door for the capture pipeline (replaces mitmdump).
+#
+# Rendered by the official nginx image's envsubst templating: ${LISTEN_PORT},
+# ${GATEWAY_HOST}, ${GATEWAY_PORT}, ${SAMPLE_PCT} come from the container env
+# (see docker-compose.yml). nginx's own $variables are left untouched.
+#
+# Why nginx and not mitmproxy: producers are fire-and-forget (they send a
+# request and disconnect without reading the response). mitmproxy aborts such
+# transactions before forwarding. nginx buffers the full request and, with
+# proxy_ignore_client_abort, completes the upstream call regardless — so traffic
+# reliably reaches the Gateway -> Forest.
+
+upstream gateway_upstream {
+    server ${GATEWAY_HOST}:${GATEWAY_PORT};
+    keepalive 64;
+}
+
+# Sample ~${SAMPLE_PCT}% of requests through to the Gateway; close the rest.
+# Keyed on $request_id (unique per request) for a stable pseudo-random split.
+split_clients "$request_id" $sampled {
+    ${SAMPLE_PCT}%   yes;
+    *                no;
+}
+
+server {
+    listen ${LISTEN_PORT};
+
+    # Buffer the entire request and keep the upstream call alive even if the
+    # producer hangs up immediately after sending (fire-and-forget).
+    proxy_request_buffering on;
+    proxy_ignore_client_abort on;
+    client_max_body_size 50m;
+    proxy_read_timeout 60s;
+
+    location / {
+        if ($sampled = no) {
+            return 444;            # drop/close non-sampled requests
+        }
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_pass http://gateway_upstream;
+    }
+}
