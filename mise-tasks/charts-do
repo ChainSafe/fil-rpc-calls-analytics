@@ -1,9 +1,9 @@
 #!/usr/bin/env python
-#MISE description="Render the parquet + server-resource charts: per-node load-over-time (RPC demand + CPU/mem/disk + response) and a node-vs-node resource head-to-head (CPU/mem/disk, leaner node greens). Args: <node-a.parquet> <node-b.parquet> [out_dir=charts]. Run fetch-do first."
+#MISE description="Render the parquet + server-resource chart: a node-vs-node load-over-time overlay — server CPU/mem over the same observation window, one clock. Args: <node-a.parquet> <node-b.parquet> [out_dir=charts]. Run fetch-do first."
 
 import sys
 from pathlib import Path
-from statistics import mean, median
+from statistics import mean
 
 # This task lives in mise-tasks/, but the chart toolkit (chart_kit) and the data
 # layers (do_metrics, rpc_queries) live in the repo root. Put the root on sys.path
@@ -16,9 +16,8 @@ import pandas as pd
 import do_metrics as dm
 import rpc_queries as rq
 from chart_kit import (
-    INK, FAINT, GREEN, RED, PURPLE, TEAL, STONE,
-    style, save, per_flow, date_label, over_time_chart,
-    colour_lower_better, node_legend,
+    MUTED, GREEN,
+    style, save, per_flow, date_label, node_legend,
 )
 
 # Resource charts keep the slightly larger title styling the deck has always used.
@@ -32,79 +31,70 @@ def parquet_span(path):
     return t0, (float(pf["ts_start"].max()) - t0) / 3600
 
 
-# ============== load + resources + latency over time (folds in resource-peak)
-def load_over_time(path, w, node):
-    """One node's "under real load" timeline: RPC demand, then whole-server
-    CPU / memory / disk (each panel's title carries its avg/peak vs capacity, so
-    the headroom story rides along), then median response. Folds in the old
-    resource-peak chart — the avg/peak numbers live in the panel titles and disk
-    is scaled to its full 619 GB so its low, flat usage reads as headroom.
-    """
-    pf = per_flow(path)
-    t0 = float(pf["ts_start"].min())
-    t1 = float(pf["ts_start"].max())
-    clip = lambda s: [v for tt, v in s if t0 <= tt <= t1]
-    cpu, mem, disk = clip(dm.cpu_series(w)), clip(dm.mem_series(w)), clip(dm.disk_series(w))
-    total = dm.mem_stats(w)["total"]
-    cores = dm.cpu_stats(w)["cores"]
-    dsize = dm.disk_stats(w)["size"]
-    resources = [
-        {"df": dm.cpu_overlay(w, t0), "field": "cpu", "color": PURPLE,
-         "title": f"server CPU used (%) — {cores} cores · avg {mean(cpu):.0f}% · peak {max(cpu):.0f}%"},
-        {"df": dm.mem_overlay(w, t0), "field": "mem", "color": TEAL,
-         "title": f"server memory used (GB) — of 32 GB · avg {mean(mem):.0f} GB ({100 * mean(mem) / total:.0f}%) "
-                  f"· peak {max(mem):.0f} GB ({100 * max(mem) / total:.0f}%)"},
-        {"df": dm.disk_overlay(w, t0), "field": "disk", "color": STONE, "domain": [0, dsize],
-         "title": f"server disk used (GB) — of {dsize:.0f} GB · DB footprint ~{mean(disk):.0f} GB "
-                  f"({100 * mean(disk) / dsize:.0f}%)"},
-    ]
-    return over_time_chart(path, resources=resources, node=node)
+# ========= both nodes under load, one clock (coalesces the two per-node timelines)
+def load_compare(bp, ap, bw, aw):
+    """Both nodes' "under real load" stories in ONE chart: server CPU and
+    memory while serving the workload — each panel overlays the two nodes on
+    the same elapsed-hours clock, over the SAME observation window (the first
+    N hours of each run, N = the shorter run; the workloads mirror each other,
+    so equal hours = comparable load, and neither line nor its average covers
+    time the other can't answer for). Each panel's title carries the delta as
+    an ABSOLUTE gap (cores / GB), never a % (reviewer rule). No demand panel
+    (the reader assumes a fair comparison), no latency panel (it has its own
+    per-flow/per-call charts), and no disk panel (the server also stores
+    unrelated files, some removed between the runs, so whole-server disk
+    movement says nothing about either node)."""
+    runs = []
+    for path, w, full in ((bp, bw, A_FULL), (ap, aw, B_FULL)):
+        pf = per_flow(path)
+        runs.append((w, float(pf["ts_start"].min()), float(pf["ts_start"].max()), full))
+    span = min((t1 - t0) / 3600 for w, t0, t1, full in runs)
+    frames = {"cpu": [], "mem": []}
+    stats = {}
+    for w, t0, _t1, full in runs:
+        end = t0 + span * 3600
+        for key, overlay in (("cpu", dm.cpu_overlay(w, t0)), ("mem", dm.mem_overlay(w, t0))):
+            d = overlay[(overlay["hour"] >= 0) & (overlay["hour"] <= span)].copy()
+            d["node_label"] = full
+            frames[key].append(d)
+        clip = lambda s: [v for t, v in s if t0 <= t <= end]
+        stats[full] = dict(cpu=mean(clip(dm.cpu_series(w))), mem=mean(clip(dm.mem_series(w))))
+    sa, sb = stats[A_FULL], stats[B_FULL]
+    cores = dm.cpu_stats(bw)["cores"]
+    total = dm.mem_stats(bw)["total"]
+    # The headline deltas, in real units: how many CPU cores and how many GB of
+    # RAM the after node needs less (or more) than the before node on average.
+    cpu_d = sb["cpu"] - sa["cpu"]
+    cores_d = cpu_d / 100 * cores
+    mem_d = sb["mem"] - sa["mem"]
+    colour = node_legend([A_FULL, B_FULL], GREEN)
 
+    # Stacked panels sharing the elapsed-hours axis; each keeps its OWN y-scale.
+    def panel(key, field, title, height, *, bottom=False):
+        df = pd.concat(frames[key], ignore_index=True)
+        return alt.Chart(df).mark_line(strokeWidth=2).encode(
+            x=alt.X("hour:Q", scale=alt.Scale(nice=False, domain=[0, span]),
+                    title="hours elapsed" if bottom else None,
+                    axis=alt.Axis(labels=bottom, ticks=bottom, grid=False)),
+            y=alt.Y(f"{field}:Q", title=None, scale=alt.Scale(zero=True)),
+            color=colour,
+        ).properties(width=760, height=height, title=alt.TitleParams(
+            text=title, anchor="start", fontSize=12.5, fontWeight=700, color=MUTED, dy=-2))
 
-# --------------------------------- resource footprint (before-node baseline vs after-node)
-def resource_compare(bp, ap, bw, aw):
-    """Whole-server footprint at comparable load. The before node (A) is the grey
-    baseline; the after node (B) carries the verdict colour — green when it runs
-    leaner (less CPU / memory / disk for the same work), red when heavier. The move
-    sits under each panel and the headline sums it up; builds self-label from the
-    data via node_identity."""
-    rps_a, rps_b = rq.headline(bp)["req_per_s"], rq.headline(ap)["req_per_s"]
-    metrics = [  # (title, unit, fmt, A value, B value) — lower is leaner
-        ("CPU used", "% of box", ".0f",
-         dm.cpu_stats(bw)["util_mean"], dm.cpu_stats(aw)["util_mean"]),
-        ("Memory used", "GB", ".1f",
-         dm.mem_stats(bw)["used_mean"], dm.mem_stats(aw)["used_mean"]),
-        ("Disk (DB footprint)", "GB", ".0f",
-         dm.disk_stats(bw)["used_mean"], dm.disk_stats(aw)["used_mean"]),
-    ]
-    # One verdict colour for the after node, from the median move across the three
-    # resources — green if it runs leaner overall (lower is better for all three).
-    moves = [((vb - va) / va * 100 if va else 0.0) for _, _, _, va, vb in metrics]
-    after_color = GREEN if median(moves) < 0 else RED if median(moves) > 0 else FAINT
-
-    def panel(title, unit, fmt, va, vb):
-        d = (vb - va) / va * 100 if va else 0.0
-        df = pd.DataFrame([{"node": A_LBL, "node_label": A_FULL, "v": va},
-                           {"node": B_LBL, "node_label": B_FULL, "v": vb}])
-        base = alt.Chart(df).encode(
-            x=alt.X("node:N", sort=[A_LBL, B_LBL], title=None, axis=alt.Axis(
-                labelFontSize=13, labelFontWeight=600, labelColor=INK, labelAngle=0)),
-            y=alt.Y("v:Q", title=unit, scale=alt.Scale(domain=[0, max(va, vb) * 1.28])))
-        bars = base.mark_bar(size=64, cornerRadius=5).encode(
-            color=node_legend([A_FULL, B_FULL], after_color))
-        vlab = base.mark_text(dy=-9, fontSize=14, fontWeight=600, color=INK).encode(
-            text=alt.Text("v:Q", format=fmt))
-        return (bars + vlab).properties(width=220, height=300, title=alt.TitleParams(
-            title, subtitle=f"{'down' if d < 0 else 'up'} {abs(d):.0f}%", fontSize=14,
-            color=INK, anchor="start", subtitleColor=colour_lower_better(va, vb),
-            subtitleFontSize=12.5, subtitleFontWeight=700))
-
-    chart = alt.hconcat(*[panel(*m) for m in metrics], spacing=46).resolve_scale(color="shared")
-    parts = [f"{title.split()[0].lower()} {'down' if d < 0 else 'up'} {abs(d):.0f}%"
-             for (title, *_), d in zip(metrics, moves)]
-    return style(chart, f"Resource footprint — {A_LBL} vs {B_LBL} at comparable load",
-                 f"Improvement: {', '.join(parts)} — measured at {rps_a:.0f} vs {rps_b:.0f} req/s.",
-                 **RES)
+    chart = alt.vconcat(
+        panel("cpu", "cpu",
+              f"server CPU used (%) — {cores} cores · avg {A_LBL} {sa['cpu']:.0f}% vs {B_LBL} {sb['cpu']:.0f}% "
+              f"({abs(cores_d):.1f} cores {'fewer' if cpu_d < 0 else 'more'})",
+              105),
+        panel("mem", "mem",
+              f"server memory used (GB) — of {total:.0f} GB · avg {A_LBL} {sa['mem']:.1f} GB vs {B_LBL} {sb['mem']:.1f} GB "
+              f"({abs(mem_d):.1f} GB {'less' if mem_d < 0 else 'more'})",
+              105, bottom=True),
+        spacing=12,
+    ).resolve_scale(color="shared")
+    return style(chart, f"Under real load — {A_LBL} vs {B_LBL}",
+                 f"what serving the same workload cost the server — "
+                 f"the first {span:.0f} hours of each run, on one clock", **RES)
 
 
 # ============================================================ render
@@ -151,7 +141,5 @@ if A_LBL == B_LBL:                        # same agent (two builds) -> disambigu
 A_FULL, B_FULL = A["label"], B["label"]   # agent + version, for the node colour legend
 
 print(f"A = {A['label']} ({bw})   B = {B['label']} ({aw})   ->  {out}")
-save(load_over_time(before_path, bw, A_LBL), out / f"load-over-time-{A_LBL.lower().split()[0]}.png")
-save(load_over_time(after_path,  aw, B_LBL), out / f"load-over-time-{B_LBL.lower().split()[0]}.png")
-save(resource_compare(before_path, after_path, bw, aw), out / "resource-compare.png")
+save(load_compare(before_path, after_path, bw, aw), out / "load-over-time.png")
 print("done")

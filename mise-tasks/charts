@@ -17,7 +17,7 @@ import polars as pl
 
 import rpc_queries as rq
 from chart_kit import (
-    INK, MUTED, GRID, FAINT, GREEN, RED, TEAL, BLUE, PURPLE, FONT, NEUTRAL,
+    INK, MUTED, GRID, FAINT, GREEN, RED, TEAL, BLUE, FONT, NEUTRAL,
     human, ms, style, save, per_flow, date_label, colour_lower_better, node_legend,
 )
 
@@ -50,11 +50,15 @@ GREY = FAINT  # the muted "before" baseline tone (the after node carries the ver
 
 
 # ============================================================ latency dumbbells (PNG)
+METRICS = ("avg", "p50", "p95", "p99")
+
+
 def latencies(path: str) -> dict[str, dict[str, float]]:
     df = pl.scan_parquet(path).filter(pl.col("duration_ms").is_not_null())
     flow = df.unique(subset=["flow_id"])
     f = flow.select(
         pl.col("duration_ms").mean().alias("avg"),
+        pl.col("duration_ms").quantile(0.5).alias("p50"),
         pl.col("duration_ms").quantile(0.95).alias("p95"),
         pl.col("duration_ms").quantile(0.99).alias("p99"),
     ).collect().row(0, named=True)
@@ -62,6 +66,7 @@ def latencies(path: str) -> dict[str, dict[str, float]]:
         (pl.col("duration_ms") / pl.col("batch_size")).alias("per_call_ms")
     ).select(
         pl.col("per_call_ms").mean().alias("avg"),
+        pl.col("per_call_ms").quantile(0.5).alias("p50"),
         pl.col("per_call_ms").quantile(0.95).alias("p95"),
         pl.col("per_call_ms").quantile(0.99).alias("p99"),
     ).collect().row(0, named=True)
@@ -73,7 +78,7 @@ b = latencies(after_path)
 
 rows = []
 for view in ("per-flow", "per-call amortized"):
-    for metric in ("avg", "p95", "p99"):
+    for metric in METRICS:
         rows.append({"view": view, "metric": metric, "phase": A_LBL,
                      "node_label": A_FULL, "ms": a[view][metric]})
         rows.append({"view": view, "metric": metric, "phase": B_LBL,
@@ -81,62 +86,64 @@ for view in ("per-flow", "per-call amortized"):
 data = pl.DataFrame(rows).to_pandas()
 
 
+def _delta_label(a_ms: float, b_ms: float) -> str:
+    """The gap between the two bars in real time units — '560 ms faster',
+    '6.3 ms slower', '13.5 s faster' — absolute, never a % (reviewer rule)."""
+    d = b_ms - a_ms
+    mag = abs(d)
+    txt = (f"{mag / 1000:.1f} s" if mag >= 1000
+           else f"{mag:.0f} ms" if mag >= 10 else f"{mag:.1f} ms")
+    return f"{txt} {'faster' if d < 0 else 'slower'}"
+
+
 def render(view: str, filename: str, title: str) -> None:
     sub = data[data["view"] == view].copy()
-    deltas, parts, d_values = [], [], []
-    for metric in ("avg", "p95", "p99"):
+
+    # One colour per node (user's final call after trying per-panel verdict
+    # colours): Lotus is the grey baseline and Forest wears its identity green
+    # on EVERY panel — including p50, which Lotus wins. The bar heights and ms
+    # labels carry that truth; a red bar shouted "slow" louder than the deck
+    # wants. Green only flips if the OVERALL verdict (median across metrics)
+    # regresses. Each panel carries its delta as the x-axis title (Vega centres
+    # it) — an ABSOLUTE gap in real time units, never a %.
+    d_values, deltas = [], {}
+    for metric in METRICS:
         a_ms = sub[(sub.metric == metric) & (sub.phase == A_LBL)]["ms"].iloc[0]
         b_ms = sub[(sub.metric == metric) & (sub.phase == B_LBL)]["ms"].iloc[0]
-        d = (b_ms - a_ms) / a_ms * 100 if a_ms else 0.0
-        d_values.append(d)
-        verb = "down" if d < 0 else "up"
-        deltas.append({"metric": metric, "label": f"{d:+.1f}%",
-                       "color": colour_lower_better(a_ms, b_ms)})
-        parts.append(f"{metric} {verb} {abs(d):.1f}% ({a_ms:.1f} → {b_ms:.1f} ms)")
-    delta_df = pd.DataFrame(deltas)
-
-    # One colour per node: the before node (A) is the grey baseline; the after node
-    # (B) carries the overall verdict — green if the typical metric improved (fell),
-    # red if it regressed. The per-metric direction lives in the Δ% row below.
+        d_values.append((b_ms - a_ms) / a_ms * 100 if a_ms else 0.0)
+        deltas[metric] = {"label": _delta_label(a_ms, b_ms),
+                          "colour": colour_lower_better(a_ms, b_ms)}
     overall = float(np.median(d_values)) if d_values else 0.0
     after_color = GREEN if overall < 0 else RED if overall > 0 else FAINT
 
-    base = alt.Chart(sub).encode(
-        x=alt.X("phase:N", sort=[A_LBL, B_LBL], title=None,
-                axis=alt.Axis(labelAngle=0, labelPadding=4),
-                scale=alt.Scale(paddingInner=0.4, paddingOuter=0.3)),
-        y=alt.Y("ms:Q", title="latency (ms)"),
-    )
-    bars = base.mark_bar(size=42).encode(
-        color=node_legend([A_FULL, B_FULL], after_color),
-        tooltip=["metric", "phase", alt.Tooltip("ms:Q", format=".1f")],
-    )
-    labels = base.mark_text(dy=-6, fontSize=11).encode(
-        text=alt.Text("ms:Q", format=".1f"),
-    )
-    bar_chart = (
-        alt.layer(bars, labels)
-           .properties(width=170, height=280)
-           .facet(column=alt.Column("metric:N", sort=["avg", "p95", "p99"],
-                                    title=None, header=alt.Header(labelFontSize=13)),
-                  spacing=40)
-           .resolve_scale(y="independent")   # each metric its own scale (p99's tail won't crush avg/p95)
-    )
+    # One standalone chart per metric, hconcat'd — each panel keeps its own
+    # y-scale (p99's tail won't crush avg/p50/p95).
+    def panel(metric: str) -> alt.Chart:
+        base = alt.Chart(sub[sub.metric == metric]).encode(
+            x=alt.X("phase:N", sort=[A_LBL, B_LBL],
+                    axis=alt.Axis(title=deltas[metric]["label"],
+                                  titleColor=deltas[metric]["colour"],
+                                  titleFontSize=12.5, titleFontWeight=600,
+                                  titlePadding=12, labelAngle=0, labelPadding=4),
+                    scale=alt.Scale(paddingInner=0.4, paddingOuter=0.3)),
+            y=alt.Y("ms:Q", title="latency (ms)"),
+        )
+        bars = base.mark_bar(size=42).encode(
+            color=node_legend([A_FULL, B_FULL], after_color),
+            tooltip=["metric", "phase", alt.Tooltip("ms:Q", format=".1f")],
+        )
+        labels = base.mark_text(dy=-6, fontSize=11).encode(
+            text=alt.Text("ms:Q", format=".1f"),
+        )
+        return (bars + labels).properties(width=170, height=280, title=alt.TitleParams(
+            text=metric, anchor="middle", fontSize=13, fontWeight="normal", color=INK))
 
-    # Δ% row, faceted so each value sits under its metric panel.
-    delta_chart = (
-        alt.Chart(delta_df)
-           .mark_text(fontSize=15, fontWeight="bold")
-           .encode(text=alt.Text("label:N"), color=alt.Color("color:N", scale=None))
-           .properties(width=170, height=24)
-           .facet(column=alt.Column("metric:N", sort=["avg", "p95", "p99"],
-                                    title=None, header=alt.Header(labels=False)),
-                  spacing=40)
-    )
-
-    chart = alt.vconcat(bar_chart, delta_chart).properties(
-        title=alt.TitleParams(text=title, subtitle="Improvement: " + "; ".join(parts) + ".",
-                              subtitleFontSize=11, subtitleColor="#555"),
+    chart = (
+        alt.hconcat(*[panel(m) for m in METRICS], spacing=40)
+           .resolve_scale(color="shared")
+           .properties(title=alt.TitleParams(
+               text=title, subtitle="lower is better · each panel has its own scale",
+               subtitleFontSize=11, subtitleColor="#555"))
     )
     save(chart, out_dir / filename)
 
@@ -490,24 +497,20 @@ def batching_chart():
                  f"({eth_alone / big:.0f}× cheaper), where {dist['100+']['calls'] / total * 100:.0f}% of calls ride")
 
 
-# ===================== what one node serves: calls, breadth, data served
+# ===================== what one node serves: calls and breadth
 def mix_chart():
-    """Three aligned panels by namespace — call volume, breadth (distinct
-    methods) and data (response bytes). Each ranks the namespaces differently
-    (eth dominates by calls, Filecoin has the widest API, trace pushes the most
-    data), so one chart shows what a single Forest node actually serves. Folds
-    in the old data-served chart, now grouped by namespace."""
+    """Two aligned panels by namespace — call volume and breadth (distinct
+    methods). Each ranks the namespaces differently (eth dominates by calls,
+    Filecoin has the widest API), so one chart shows what a single Forest node
+    actually serves. The response-bytes panel was dropped — reviewer: not
+    useful for high-level decision makers."""
     df = (rq.namespace_coverage(after_path)
-            .join(rq.namespace_bytes(after_path), on="namespace", how="left")
-            .with_columns(pl.col("bytes").fill_null(0))
             .filter(pl.col("namespace") != "other"))
     total = df["calls"].sum()
     df = df.with_columns((pl.col("calls") / total * 100).alias("share")).sort("calls", descending=True)
     order = df["namespace"].to_list()
     pdf = df.to_pandas()
     pdf["calls_lbl"] = [f"{human(c)}  ({s:.0f}%)" for c, s in zip(pdf["calls"], pdf["share"])]
-    pdf["bytes_lbl"] = [f"{b/1e9:.2f} GB" if b >= 1e9 else f"{b/1e6:.0f} MB" if b >= 1e6
-                        else f"{b/1e3:.0f} KB" if b > 0 else "—" for b in pdf["bytes"]]
 
     def panel(field, lbl_field, title, color, fmt, pad):
         base = alt.Chart(pdf).encode(y=alt.Y("namespace:N", sort=order, title=None,
@@ -522,15 +525,11 @@ def mix_chart():
 
     p_calls = panel("calls", "calls_lbl", "calls served", TEAL, "~s", 1.5)
     p_methods = panel("methods", None, "API surface — methods", BLUE, "d", 1.25)
-    p_bytes = panel("bytes", "bytes_lbl", "data — response bytes", PURPLE, "~s", 1.5)
-    chart = alt.hconcat(p_calls, p_methods, p_bytes, spacing=40)
+    chart = alt.hconcat(p_calls, p_methods, spacing=40)
     n = rq.distinct_methods(after_path)
-    total_b = float(df["bytes"].sum())
     eth_share = float(pdf.loc[pdf.namespace == "eth", "share"].sum()) if (pdf.namespace == "eth").any() else 0.0
-    top_data = pdf.sort_values("bytes", ascending=False).iloc[0]["namespace"]
     return style(chart, f"What one Forest node serves — {n} methods across {len(order)} namespaces",
-                 f"eth is ~{eth_share:.0f}% of all calls · Filecoin is the widest API · "
-                 f"{top_data} pushes most of the {total_b/1e9:.1f} GB served")
+                 f"eth is ~{eth_share:.0f}% of all calls · Filecoin is the widest API")
 
 
 # ===== appendix pool — defined but NOT rendered (kept available, off the deck) =====

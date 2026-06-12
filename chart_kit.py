@@ -1,14 +1,13 @@
 """Shared chart toolkit for Forest.
 
-Pure styling/data helpers plus the one timeline builder shared across the chart
-scripts — this module renders nothing on its own. Two importers:
+Pure styling/data helpers — this module renders nothing on its own. Two importers:
 
   * `mise-tasks/charts` (run via `mise run charts`) builds the parquet-only deck
     — reliability / batching / what-node-serves PNGs plus the latency-comparison
-    SVGs — out of these primitives.
+    charts — out of these primitives.
   * `mise-tasks/charts-do` reuses the styling helpers (`style`, `save`, colours,
-    `per_flow`, `date_label`) and the `over_time_chart` builder, passing in
-    whole-server CPU / memory / disk frames to light up its extra panels.
+    `per_flow`, `date_label`) for its load-over-time overlay and resource
+    head-to-head charts.
 
 Date labels auto-derive from `ts_start`. Wide PNGs may need `sips -Z 1700 <file>`
 to view.
@@ -24,7 +23,8 @@ import vl_convert as vlc
 
 INK, MUTED, GRID = "#111827", "#6b7280", "#e5e7eb"
 FAINT, GREEN, BLUE = "#9ca3af", "#16a34a", "#2563eb"
-RED, TEAL, AMBER = "#dc2626", "#0f766e", "#f59e0b"
+# RED is deliberately soft — it flags "worse" without screaming danger.
+RED, TEAL, AMBER = "#f28b82", "#0f766e", "#f59e0b"
 PURPLE = "#7c3aed"
 LGREEN = "#86efac"   # light green = peak headroom (used by the resource charts)
 STONE = "#78716c"    # neutral storage tone for the disk panel
@@ -134,62 +134,3 @@ def per_flow(path):
                                      pl.col("ts_start").first(),
                                      pl.col("batch_size").first())
             .collect())
-
-
-# ===== shared timeline builder: parquet demand/latency + optional DO resource panels
-def over_time_chart(path, resources=None, node="the node"):
-    """Stacked timeline panels sharing one clock: RPC demand, then (optionally)
-    whole-server resource panels supplied by the caller, then median response.
-
-    Parquet-only by default. Pass `resources` — a list of dicts
-    `{df, field, title, color, domain?}` where each `df` has an `hour` column +
-    the `field` (e.g. from `do_metrics.cpu_overlay`, aligned to this run's
-    `t0`) — to insert resource panels. `mise-tasks/charts-do` passes CPU, memory
-    and disk, each title carrying its avg/peak vs capacity (folds in the old
-    resource-peak chart). `domain` pins a panel's y-scale (disk → full capacity,
-    so its low/flat usage reads as headroom).
-    """
-    df = per_flow(path).sort("ts_start")
-    t0 = df["ts_start"].min()
-    df = df.with_columns(((pl.col("ts_start") - t0) / 3600).alias("hour"))
-    df = df.with_columns((pl.col("hour") * 6).floor().alias("bin"))  # 10-min bins
-    g = (df.group_by("bin").agg(
-            pl.col("batch_size").sum().alias("calls"),   # RPC calls (a batch = its size)
-            pl.col("duration_ms").median().alias("median"))
-         .sort("bin").with_columns((pl.col("bin") / 6).alias("hour"),
-                                   (pl.col("calls") / 600).alias("calls_s")))  # 10-min bin = 600s
-    pdf = g.to_pandas()
-    span = float(df["hour"].max())
-    med_typ = float(pdf["median"].median())
-    avg_cps = float(pdf["calls"].sum() / (span * 3600))
-
-    # Stacked panels sharing the time axis. Each metric keeps its OWN y-scale so a
-    # flat ~6 ms median isn't crushed by a climbing CPU line.
-    def panel(src, field, title, color, height, *, area=False, zero=True, bottom=False, domain=None):
-        chart = alt.Chart(src)
-        mark = (chart.mark_area(opacity=0.85, color=color, line={"color": color})
-                if area else chart.mark_line(strokeWidth=2, color=color))
-        yscale = alt.Scale(domain=domain) if domain else alt.Scale(zero=zero)
-        return mark.encode(
-            x=alt.X("hour:Q", scale=alt.Scale(nice=False, domain=[0, span]),
-                    title="hours elapsed" if bottom else None,
-                    axis=alt.Axis(labels=bottom, ticks=bottom, grid=False)),
-            y=alt.Y(f"{field}:Q", title=None, scale=yscale)
-        ).properties(width=760, height=height, title=alt.TitleParams(
-            text=title, anchor="start", fontSize=12.5, fontWeight=700, color=MUTED, dy=-2))
-
-    # demand (parquet) → what it cost the server → how fast it answered (parquet)
-    panels = [panel(pdf, "calls_s", "RPC demand — calls (queries) / sec", GREEN, 105, area=True)]
-    for r in (resources or []):
-        d = r["df"]
-        d = d[(d["hour"] >= 0) & (d["hour"] <= span)]
-        panels.append(panel(d, r["field"], r["title"], r["color"], 88, domain=r.get("domain")))
-    panels += [panel(pdf, "median", "typical response — median (ms)", BLUE, 105,
-                     zero=False, bottom=True)]
-    chart = alt.vconcat(*panels, spacing=12)
-    sub = (f"client demand, whole-server CPU / memory / disk, and typical response — same {span:.0f}-hour "
-           f"clock · ~{avg_cps:.0f} calls/sec at ~{med_typ:.0f} ms typical"
-           if resources else
-           f"sustained for {span:.0f} hours · {node} answered ~{avg_cps:.0f} RPC calls/sec "
-           f"at ~{med_typ:.0f} ms typical")
-    return style(chart, f"{node} under real load", sub)

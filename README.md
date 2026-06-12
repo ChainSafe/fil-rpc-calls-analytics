@@ -34,7 +34,7 @@ All analysis tasks read `calls.parquet` by default; override with `PARQUET=path 
 Polished charts land in `charts/`, split by the data they need:
 
 - **Parquet only** — `mise run charts <before.parquet> <after.parquet>` renders the business deck (`reliability`, `batching`, `what-node-serves`) plus the technical before/after latency comparisons — all PNG. No DigitalOcean data required.
-- **Parquet + DigitalOcean** — `mise run charts-do <before.parquet> <after.parquet>` renders the charts that fuse RPC capture with whole-server resource data: `load-over-time` (RPC demand + CPU/memory/disk + latency on one clock) and `scalability`. Needs `do-metrics/` populated.
+- **Parquet + DigitalOcean** — `mise run charts-do <node-a.parquet> <node-b.parquet>` renders `load-over-time`: both nodes' whole-server CPU and memory overlaid on one clock, over the same observation window (trimmed to the shorter run). Needs `do-metrics/` populated.
 
 Populate `do-metrics/` first (the window is auto-derived from each parquet, so the resource data lines up with the captured traffic):
 
