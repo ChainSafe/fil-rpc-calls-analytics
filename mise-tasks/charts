@@ -1,11 +1,14 @@
 #!/usr/bin/env python
-#MISE description="Render latency-reduction comparison charts (Altair SVG). Args: <before.parquet> <after.parquet> [top_n=30]. CHARTS_DIR=out."
+#MISE description="Render latency comparison charts (Altair SVG). Node+version auto-detected from filenames (calls-<node>-<version>.parquet). Args: <before.parquet> <after.parquet> [top_n=30]. CHARTS_DIR=out."
 
 import os
+import re
+import statistics
 import sys
 from pathlib import Path
 
 import altair as alt
+import pandas as pd
 import polars as pl
 
 
@@ -15,9 +18,60 @@ if len(sys.argv) < 3:
 
 before_path = sys.argv[1]
 after_path = sys.argv[2]
-top_n = int(sys.argv[3]) if len(sys.argv) > 3 else 30
+top_n = int(sys.argv[3]) if len(sys.argv) > 3 else 10
 out_dir = Path(os.environ.get("CHARTS_DIR", "charts"))
 out_dir.mkdir(exist_ok=True)
+
+GREEN = "#16a34a"
+GREY  = "#9ca3af"
+RED   = "#dc2626"
+BLUE  = "#2563eb"
+
+
+def verdict_color(before: float, after: float) -> str:
+    """Verdict colour for a before→after pair on our shared palette: green when
+    it improved (after is lower), red when it regressed, grey when unchanged."""
+    return GREEN if after < before else RED if after > before else GREY
+
+
+def node_legend(color_field: str, domain: list[str], after_color: str) -> alt.Color:
+    """The two-entry node colour legend shared by the bar and dumbbell charts:
+    the first label in `domain` (before node) is grey, the second (after node)
+    takes `after_color`. `color_field` is the data column holding the label."""
+    return alt.Color(f"{color_field}:N", sort=domain,
+                     scale=alt.Scale(domain=domain, range=[GREY, after_color]),
+                     legend=alt.Legend(title=None, orient="bottom"))
+
+
+def node_and_version(path: str) -> tuple[str, str]:
+    """Best-effort (node, version) from a capture filename in the expected
+    form calls-<node>-<version>.parquet, e.g.
+    calls-forest-1.2.parquet  -> ("forest", "1.2"),
+    calls-lotus-v1.18.parquet -> ("lotus", "v1.18"),
+    calls-forest2.parquet     -> ("forest", "")   (no version, legacy).
+    Strips the capture prefix (calls/flows) and any trailing run digits on the
+    node, and treats everything after the first separator as the version."""
+    stem = Path(path).stem
+    stem = re.sub(r"^(calls|flows)[-_. ]*", "", stem, flags=re.IGNORECASE)
+    node, _, version = stem.partition("-")
+    node = re.sub(r"\d+$", "", node).lower() or node.lower()
+    return node, version.strip("-_. ")
+
+
+def labelled(name: str, version: str) -> str:
+    return f"{name} {version}".strip() if version else name
+
+
+before_name, before_version = node_and_version(before_path)
+after_name, after_version = node_and_version(after_path)
+before_label = labelled(before_name, before_version)
+after_label = labelled(after_name, after_version)
+# If the two captures can't be told apart by node name (same node, or neither
+# parsed to a real name), fall back to plain before/after everywhere so titles
+# read sensibly and the bar x-axis categories don't collide.
+if before_name == after_name:
+    before_name, after_name = "before", "after"
+    before_label, after_label = "before", "after"
 
 
 def latencies(path: str) -> dict[str, dict[str, float]]:
@@ -44,44 +98,42 @@ b = latencies(after_path)
 rows = []
 for view in ("per-flow", "per-call amortized"):
     for metric in ("avg", "p95", "p99"):
-        rows.append({"view": view, "metric": metric, "phase": "before", "ms": a[view][metric]})
-        rows.append({"view": view, "metric": metric, "phase": "after",  "ms": b[view][metric]})
+        rows.append({"view": view, "metric": metric, "phase": "before",
+                     "node": before_name, "node_label": before_label, "ms": a[view][metric]})
+        rows.append({"view": view, "metric": metric, "phase": "after",
+                     "node": after_name, "node_label": after_label, "ms": b[view][metric]})
 data = pl.DataFrame(rows).to_pandas()
-
-
-GREEN = "#16a34a"
-GREY  = "#9ca3af"
-RED   = "#dc2626"
-BLUE  = "#2563eb"
 
 
 def render(view: str, filename: str, title: str) -> None:
     sub = data[data["view"] == view].copy()
-    deltas, sentence_parts, after_fill = [], [], {}
+    deltas, sentence_parts, after_fill, d_values = [], [], {}, []
     for metric in ("avg", "p95", "p99"):
         before_ms = sub.loc[(sub.metric == metric) & (sub.phase == "before"), "ms"].iloc[0]
         after_ms  = sub.loc[(sub.metric == metric) & (sub.phase == "after"), "ms"].iloc[0]
         d = (after_ms - before_ms) / before_ms * 100 if before_ms else 0.0
-        after_fill[metric] = GREEN if after_ms < before_ms else RED if after_ms > before_ms else GREY
+        d_values.append(d)
+        after_fill[metric] = verdict_color(before_ms, after_ms)
         verb = "down" if d < 0 else "up"
         deltas.append({"metric": metric, "label": f"{d:+.1f}%", "fill": after_fill[metric]})
         sentence_parts.append(f"{metric} {verb} {abs(d):.1f}% ({before_ms:.1f} → {after_ms:.1f} ms)")
-    sub["fill"] = sub.apply(
-        lambda r: GREY if r.phase == "before" else after_fill[r.metric], axis=1)
-    delta_df = __import__("pandas").DataFrame(deltas)
-    fill_scale = alt.Scale(domain=[GREEN, RED, GREY], range=[GREEN, RED, GREY])
+    delta_df = pd.DataFrame(deltas)
+
+    # One colour per node: grey baseline, after = the overall verdict (green if
+    # the typical metric improved). Per-metric direction stays in the Δ% row.
+    overall = statistics.median(d_values) if d_values else 0.0
+    after_color = GREEN if overall < 0 else RED if overall > 0 else GREY
+    node_domain = [before_label, after_label]
 
     base = alt.Chart(sub).encode(
-        x=alt.X("phase:N", sort=["before", "after"], title=None,
+        x=alt.X("node:N", sort=[before_name, after_name], title=None,
                 axis=alt.Axis(labelAngle=0, labelPadding=4),
                 scale=alt.Scale(paddingInner=0.4, paddingOuter=0.3)),
         y=alt.Y("ms:Q", title="latency (ms)"),
     )
     bars = base.mark_bar(size=42).encode(
-        color=alt.condition(
-            alt.datum.phase == "before", alt.value(GREY),
-            alt.Color("fill:N", scale=fill_scale, legend=None)),
-        tooltip=["metric", "phase", alt.Tooltip("ms:Q", format=".1f")],
+        color=node_legend("node_label", node_domain, after_color),
+        tooltip=["metric", "node", "phase", alt.Tooltip("ms:Q", format=".1f")],
     )
     labels = base.mark_text(dy=-6, fontSize=11).encode(
         text=alt.Text("ms:Q", format=".1f"),
@@ -144,8 +196,6 @@ def render_method(table: pl.DataFrame) -> None:
     method: call volume (n_a→n_b), mean latency, and p95 latency. All on log
     x-scales so the wide value ranges stay readable, and the shared method rows
     let you read traffic, typical cost, and tail cost together."""
-    import pandas as pd
-
     # Log axes can't plot null/zero, so keep methods present in both runs. A
     # method with a latency in both files also has n_a > 0 and n_b > 0.
     base = (
@@ -170,8 +220,7 @@ def render_method(table: pl.DataFrame) -> None:
             d = aft - bef
             label = (f"{'+' if d >= 0 else '-'}{_human(abs(d))}"
                      if kind == "count" else f"{d:+.1f}")
-            fill = (BLUE if kind == "count" else
-                    GREEN if aft < bef else RED if aft > bef else GREY)
+            fill = BLUE if kind == "count" else verdict_color(bef, aft)
             for phase, value in (("before", bef), ("after", aft)):
                 rows.append({"method": r["method"], "panel": panel,
                              "phase": phase, "value": value,
@@ -213,7 +262,7 @@ def render_method(table: pl.DataFrame) -> None:
            .resolve_scale(x="independent")
            .configure_legend(disable=True)
            .properties(title=alt.TitleParams(
-               text=f"Per-method latency: before vs after (top {top_n} by calls)",
+               text=f"Per-method latency: {before_name} and {after_name} performance diff (top {top_n} by calls)",
                subtitle="calls panel = traffic volume (n_a→n_b); labels = Δ",
                subtitleFontSize=11, subtitleColor="#555"))
     )
@@ -260,11 +309,10 @@ def batch_summary(path: str, col: str) -> pl.DataFrame:
 
 def render_batch(col: str, filename: str, title: str) -> None:
     """Horizontal dumbbells: bucket on y, latency on x (avg and p95)."""
-    import pandas as pd
-
     sa = batch_summary(before_path, col)
     sb = batch_summary(after_path, col)
-    rows, parts, y_order = [], [], []
+    rows, y_order, deltas = [], [], []
+    metric_pcts: dict[str, list[float]] = {"avg": [], "p95": []}
     for bucket in BUCKETS:
         ra = sa.filter(pl.col("bucket") == bucket)
         rb = sb.filter(pl.col("bucket") == bucket)
@@ -272,12 +320,14 @@ def render_batch(col: str, filename: str, title: str) -> None:
             continue
         ra, rb = ra.row(0, named=True), rb.row(0, named=True)
         fa, fb = ra["flows"], rb["flows"]
-        y_order.append(f"({_human(fa)}→{_human(fb)} flows)  {bucket}")
+        y_order.append(f"{bucket}   ({_human(fa)}→{_human(fb)} flows)")
         for metric in ("avg", "p95"):
             bef, aft = ra[metric], rb[metric]
             d_abs = aft - bef
             pct = (d_abs / bef * 100) if bef else 0.0
-            fill = GREEN if aft < bef else RED if aft > bef else GREY
+            deltas.append(d_abs)
+            metric_pcts[metric].append(pct)
+            label_fill = verdict_color(bef, aft)
             lbl = f"{d_abs:+.1f} ({pct:+.1f}%)"
             lx = (bef * aft) ** 0.5
             bl = y_order[-1]
@@ -288,34 +338,41 @@ def render_batch(col: str, filename: str, title: str) -> None:
                              "flows_a": fa, "flows_b": fb,
                              "label": lbl if phase == "after" else None,
                              "label_x": lx if phase == "after" else None,
-                             "fill": fill})
+                             "fill": label_fill,
+                             "node": before_label if phase == "before" else after_label})
 
-            verb = "down" if pct < 0 else "up"
-            parts.append(f"{bucket} {metric} {verb} {abs(pct):.1f}%")
+    summary = []
+    for metric in ("avg", "p95"):
+        vals = metric_pcts[metric]
+        if not vals:
+            continue
+        m = statistics.median(vals)
+        verb = "down" if m < 0 else "up"
+        summary.append(f"{metric} {verb} {abs(m):.1f}%")
 
     long = pd.DataFrame(rows)
+    overall = statistics.median(deltas) if deltas else 0.0
+    after_color = GREEN if overall < 0 else RED if overall > 0 else GREY
+    node_domain = [before_label, after_label]
     after_only = alt.datum.phase == "after"
-    y = alt.Y("bucket_label:N", sort=y_order, title="batch size bucket",
+    y = alt.Y("bucket_label:N", sort=y_order, title="batch size buckets",
               axis=alt.Axis(labelFontSize=11, titlePadding=8))
     logx = alt.Scale(type="log")
 
     rules = alt.Chart(long).transform_filter(after_only).mark_rule(
         color=GREY, strokeWidth=2).encode(
         y=y, x=alt.X("before:Q", scale=logx, title=None), x2="after:Q")
-    fill_scale = alt.Scale(domain=[GREEN, RED, GREY], range=[GREEN, RED, GREY])
     points = alt.Chart(long).mark_point(filled=True, size=80).encode(
         y=y, x=alt.X("value:Q", scale=logx),
-        color=alt.condition(
-            alt.datum.phase == "before", alt.value(GREY),
-            alt.Color("fill:N", scale=fill_scale, legend=None)),
-        tooltip=["bucket", "metric", "phase",
-                 alt.Tooltip("flows_a:Q", title="flows_a", format=","),
-                 alt.Tooltip("flows_b:Q", title="flows_b", format=","),
+        color=node_legend("node", node_domain, after_color),
+        tooltip=["bucket", "metric", "node",
+                 alt.Tooltip("flows_a:Q", title=f"{before_name} flows", format=","),
+                 alt.Tooltip("flows_b:Q", title=f"{after_name} flows", format=","),
                  alt.Tooltip("value:Q", format=".1f")])
     labels = alt.Chart(long).transform_filter(after_only).mark_text(
         align="center", dy=-10, fontSize=10).encode(
         y=y, x=alt.X("label_x:Q", scale=logx), text="label:N",
-        color=alt.Color("fill:N", scale=None),
+        color=alt.Color("fill:N", scale=None, legend=None),
     )
 
     chart = (
@@ -325,10 +382,9 @@ def render_batch(col: str, filename: str, title: str) -> None:
                                     title=None, header=alt.Header(labelFontSize=13)),
                   spacing=40)
            .resolve_scale(x="independent")
-           .configure_legend(disable=True)
            .properties(title=alt.TitleParams(
                text=title,
-               subtitle="(…) = flows_a→flows_b; labels = Δ (Δ%)",
+               subtitle="Improvement: " + ", ".join(summary) + " (median across buckets).",
                subtitleFontSize=10, subtitleColor="#555"))
     )
     path = out_dir / filename
@@ -336,12 +392,12 @@ def render_batch(col: str, filename: str, title: str) -> None:
     print(f"  wrote {path}")
 
 
-print(f"before: {before_path}")
-print(f"after:  {after_path}")
+print(f"before: {before_path}  (node: {before_name})")
+print(f"after:  {after_path}  (node: {after_name})")
 render("per-flow",            "latency-per-flow.svg",
-       "Per-flow latency: before vs after (ms)")
+       f"Per-flow latency: {before_name} vs {after_name} (ms)")
 render("per-call amortized",  "latency-per-call.svg",
-       "Per-call amortized latency: before vs after (ms)")
+       f"Per-call amortized latency: {before_name} vs {after_name} (ms)")
 
 qcols = ("n", "mean", "p95")
 ma = per_method(before_path).rename({c: f"{c}_a" for c in qcols})
@@ -354,6 +410,6 @@ method_table = (
 render_method(method_table)
 
 render_batch("duration_ms", "latency-batch-per-flow.svg",
-             "Batched per-flow duration: before vs after (ms)")
+             f"Batched per-flow duration: {before_name} vs {after_name} (ms)")
 render_batch("per_call_ms", "latency-batch-per-call.svg",
-             "Batched per-call amortized: before vs after (ms)")
+             f"Batched per-call amortized: {before_name} vs {after_name} (ms)")
