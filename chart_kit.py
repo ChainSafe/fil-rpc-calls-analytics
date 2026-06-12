@@ -82,14 +82,15 @@ def colour_vs_load(before, after, load_pct, *, flat=3.0):
     return GREEN if ratio <= 0.5 else (AMBER if ratio <= 1.0 else RED)
 
 
-def node_legend(domain, after_color, *, field="node_label"):
-    """Two-entry node colour legend shared by the before/after bar + dumbbell charts:
-    the before node (`domain[0]`) is the grey baseline, the after node (`domain[1]`)
-    takes `after_color` (green if it improved, red if it regressed). `field` is the
-    data column holding the labels (agent + version), so the legend dots read
-    "Lotus v… ● · Forest v… ●"."""
+def node_legend(domain, colours, *, field="node_label"):
+    """Node colour legend shared by the comparison charts. `domain` lists the
+    node labels in DISPLAY order and `colours` the colour each one wears —
+    the compared node its verdict colour, the baseline node grey — so display
+    order and colour semantics stay independent. `field` is the data column
+    holding the labels (agent + version), so the legend dots read
+    "Forest v… ● · Lotus v… ●"."""
     return alt.Color(f"{field}:N", sort=domain,
-                     scale=alt.Scale(domain=domain, range=[FAINT, after_color]),
+                     scale=alt.Scale(domain=domain, range=colours),
                      legend=alt.Legend(title=None, orient="bottom"))
 
 

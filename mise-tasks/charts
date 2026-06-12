@@ -52,6 +52,13 @@ GREY = FAINT  # the muted "before" baseline tone (the after node carries the ver
 # ============================================================ latency dumbbells (PNG)
 METRICS = ("avg", "p50", "p95", "p99")
 
+# Fixed round y-caps per panel (user-tuned for the deck): clean axes, and the
+# p50 panel stops dramatising a few-ms gap by towering to the chart top. The
+# data always wins over a cap — if a run outgrows one, the axis grows past it
+# rather than clipping the bar (p95/p99 sit above the first picks of 1000/10k
+# for exactly that reason: Lotus measures ~1.1 s and ~14 s there).
+Y_CAPS = {"avg": 1000, "p50": 100, "p95": 1500, "p99": 15_000}
+
 
 def latencies(path: str) -> dict[str, dict[str, float]]:
     df = pl.scan_parquet(path).filter(pl.col("duration_ms").is_not_null())
@@ -117,19 +124,23 @@ def render(view: str, filename: str, title: str) -> None:
     after_color = GREEN if overall < 0 else RED if overall > 0 else FAINT
 
     # One standalone chart per metric, hconcat'd — each panel keeps its own
-    # y-scale (p99's tail won't crush avg/p50/p95).
+    # round-capped y-scale (p99's tail won't crush avg/p50/p95).
     def panel(metric: str) -> alt.Chart:
-        base = alt.Chart(sub[sub.metric == metric]).encode(
-            x=alt.X("phase:N", sort=[A_LBL, B_LBL],
+        m = sub[sub.metric == metric]
+        cap = Y_CAPS[metric]
+        top = float(m["ms"].max())
+        base = alt.Chart(m).encode(
+            x=alt.X("phase:N", sort=[B_LBL, A_LBL],   # Forest (ours) first, then the baseline
                     axis=alt.Axis(title=deltas[metric]["label"],
                                   titleColor=deltas[metric]["colour"],
                                   titleFontSize=12.5, titleFontWeight=600,
                                   titlePadding=12, labelAngle=0, labelPadding=4),
                     scale=alt.Scale(paddingInner=0.4, paddingOuter=0.3)),
-            y=alt.Y("ms:Q", title="latency (ms)"),
+            y=alt.Y("ms:Q", title="latency (ms)",
+                    scale=alt.Scale(domain=[0, cap if top <= cap else top * 1.08])),
         )
         bars = base.mark_bar(size=42).encode(
-            color=node_legend([A_FULL, B_FULL], after_color),
+            color=node_legend([B_FULL, A_FULL], [after_color, FAINT]),
             tooltip=["metric", "phase", alt.Tooltip("ms:Q", format=".1f")],
         )
         labels = base.mark_text(dy=-6, fontSize=11).encode(
@@ -198,7 +209,7 @@ def render_method(table: pl.DataFrame) -> None:
     # Lotus is the grey baseline; Forest greens when faster, reds when slower;
     # call volume is neutral blue.
     S_LOTUS, S_FAST, S_SLOW, S_VOL = A_FULL, f"{B_FULL} faster", f"{B_FULL} slower", "call volume"
-    series_domain = [S_LOTUS, S_FAST, S_SLOW, S_VOL]
+    series_domain = [S_FAST, S_SLOW, S_LOTUS, S_VOL]   # Forest's entries lead the legend
 
     rows = []
     for panel, ca, cb, kind in panels:
@@ -229,7 +240,7 @@ def render_method(table: pl.DataFrame) -> None:
     logx = alt.Scale(type="log")
     after_only = alt.datum.phase == B_LBL
     color_enc = alt.Color("series:N", sort=series_domain,
-                          scale=alt.Scale(domain=series_domain, range=[GREY, GREEN, RED, NEUTRAL]),
+                          scale=alt.Scale(domain=series_domain, range=[GREEN, RED, GREY, NEUTRAL]),
                           legend=alt.Legend(title=None, orient="bottom"))
 
     rules = alt.Chart(long).transform_filter(after_only).mark_rule(
@@ -254,7 +265,7 @@ def render_method(table: pl.DataFrame) -> None:
                   spacing=46)
            .resolve_scale(x="independent")
            .properties(title=alt.TitleParams(
-               text=f"Per-method latency — {A_LBL} vs {B_LBL} (top {top_n} by calls)",
+               text=f"Per-method latency — {B_LBL} vs {A_LBL} (top {top_n} by calls)",
                subtitle="each row: Lotus → Forest · % = Forest's latency vs Lotus (− faster, + slower) · calls panel = volume",
                subtitleFontSize=11, subtitleColor="#555"))
     )
@@ -356,7 +367,7 @@ def render_batch(col: str, filename: str, title: str) -> None:
         y=y, x=alt.X("before:Q", scale=logx, title=None), x2="after:Q")
     points = alt.Chart(long).mark_point(filled=True, size=80).encode(
         y=y, x=alt.X("value:Q", scale=logx),
-        color=node_legend([A_FULL, B_FULL], after_color),
+        color=node_legend([B_FULL, A_FULL], [after_color, FAINT]),
         tooltip=["bucket", "metric", "phase",
                  alt.Tooltip("flows_a:Q", title="flows_a", format=","),
                  alt.Tooltip("flows_b:Q", title="flows_b", format=","),
@@ -720,9 +731,9 @@ def error_chart():
 print(f"A = {A['label']}   ({before_path})")
 print(f"B = {B['label']}   ({after_path})")
 
-# before/after latency-comparison dumbbells (PNG)
-render("per-flow",            "latency-per-flow.png", f"Per-flow latency: {A_LBL} vs {B_LBL} (ms)")
-render("per-call amortized",  "latency-per-call.png", f"Per-call amortized latency: {A_LBL} vs {B_LBL} (ms)")
+# latency-comparison charts (PNG) — our node (B) leads the title and the bars
+render("per-flow",            "latency-per-flow.png", f"Per-flow latency: {B_LBL} vs {A_LBL} (ms)")
+render("per-call amortized",  "latency-per-call.png", f"Per-call amortized latency: {B_LBL} vs {A_LBL} (ms)")
 
 qcols = ("n", "mean", "p95")
 ma = per_method(before_path).rename({c: f"{c}_a" for c in qcols})
@@ -734,8 +745,8 @@ method_table = (
 )
 render_method(method_table)
 
-render_batch("duration_ms", "latency-batch-per-flow.png", f"Batched per-flow duration: {A_LBL} vs {B_LBL} (ms)")
-render_batch("per_call_ms", "latency-batch-per-call.png", f"Batched per-call amortized: {A_LBL} vs {B_LBL} (ms)")
+render_batch("duration_ms", "latency-batch-per-flow.png", f"Batched per-flow duration: {B_LBL} vs {A_LBL} (ms)")
+render_batch("per_call_ms", "latency-batch-per-call.png", f"Batched per-call amortized: {B_LBL} vs {A_LBL} (ms)")
 
 # single-run business deck (PNG, from the AFTER parquet)
 save(reliability_hero(), out_dir / "reliability.png")
