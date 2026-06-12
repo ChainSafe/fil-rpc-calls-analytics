@@ -7,11 +7,11 @@ _.python.venv = { path = ".venv", create = true }
 
 [tasks.install]
 description = "Install Python deps"
-run = "uv pip install mitmproxy pyarrow polars brotli zstandard altair vl-convert-python pandas pytest"
+run = "uv pip install mitmproxy pyarrow polars brotli zstandard altair vl-convert-python pandas pytest dpkt"
 
 [tasks.test]
 description = "Run the test suite"
 depends = ["install"]
-run = "python -m pytest test_flows_to_parquet.py"
+run = "python -m pytest"
 
 

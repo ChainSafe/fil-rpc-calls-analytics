@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+#MISE description="Prove from a pcap whether the producer truncates request bodies. Usage: prove-truncation <capture.pcap>. Set PORT=<listen_port> (default 1234), LABEL=<where captured>."
+#MISE depends=["install"]
+set -euo pipefail
+
+pcap="${1:-}"
+port="${PORT:-1234}"
+label="${LABEL:-unspecified ingress point}"
+
+if [[ -z "$pcap" ]]; then
+    cat >&2 <<EOF
+usage: mise run prove-truncation <capture.pcap>
+
+First capture at the first hop you control (plaintext HTTP only):
+    sudo tcpdump -i <iface> -s 0 -w producer.pcap 'tcp port ${port}'
+
+Then:
+    PORT=${port} LABEL="my edge" mise run prove-truncation producer.pcap
+EOF
+    exit 64
+fi
+
+python prove_truncation.py analyze "$pcap" --port "$port" --label "$label"

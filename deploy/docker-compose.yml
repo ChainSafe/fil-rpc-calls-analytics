@@ -1,0 +1,51 @@
+# Capture pipeline — the VPS needs nothing but Docker.
+#
+#   nginx     : front door on :2345, buffers requests, samples SAMPLE_PCT% to the
+#               Lotus Gateway (rest get 444). Uses host networking so its upstream
+#               call to the Gateway rides the host loopback.
+#   tcpdump   : passive capture of the captured leg on `lo`, rotating pcaps into
+#               ./captures. Copy those to a dev machine and run `mise run pcap-convert`.
+#
+# Start:   docker compose up -d --build
+# Tune %:  edit SAMPLE_PCT (e.g. 100 for everything), then `docker compose up -d`.
+#
+# Capture leg (CAP_PORT):
+#   - in front of the Gateway (default): set CAP_PORT = GATEWAY_PORT  -> nginx<->Gateway
+#     (original method names like eth_call + responses; best match to existing parquet)
+#   - Gateway<->Forest: set CAP_PORT = Forest's port
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    network_mode: host
+    environment:
+      LISTEN_PORT: "2345"          # where producers connect (was mitmdump)
+      GATEWAY_HOST: "127.0.0.1"
+      GATEWAY_PORT: "3456"         # Lotus Gateway listen port
+      SAMPLE_PCT: "50"             # % forwarded to the Gateway; rest closed (444)
+    volumes:
+      - ./nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+    restart: unless-stopped
+
+  tcpdump:
+    build:
+      context: .
+      dockerfile: Dockerfile.tcpdump
+    network_mode: host
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    environment:
+      CAP_IFACE: "lo"
+      CAP_PORT: "3456"             # = GATEWAY_PORT (front-of-Gateway) or Forest's port
+    volumes:
+      - ./captures:/captures
+    # rotate hourly, keep 24 files; -s 0 = full payload (needed to recover bodies).
+    # $$ escapes compose interpolation so the shell expands the env vars at runtime.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        exec tcpdump -i "$$CAP_IFACE" -s 0
+        -w /captures/cap-%Y%m%d-%H%M%S.pcap -G 3600 -W 24
+        "tcp port $$CAP_PORT"
+    restart: unless-stopped

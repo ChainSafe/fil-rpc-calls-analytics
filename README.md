@@ -15,6 +15,9 @@ All analysis tasks read `calls.parquet` by default; override with `PARQUET=path 
 | Task | What it shows |
 |---|---|
 | `convert [input.mitm]` | `flows*.mitm` → `calls*.parquet` (default `flows.mitm` → `calls.parquet`) |
+| `pcap-convert <in.pcap\|.tar.zst> [out]` | a pcap, or a `.tar.zst` of hourly pcaps (merged into one), HTTP/1.1 JSON-RPC → `calls*.parquet`, same schema. `PORT=` (captured server port, required), `BAN_IPS=`. See `deploy/` |
+| `healthcheck [input.mitm]` | Scan a dump and flag POST flows whose request body wasn't captured (half-captured dumps) |
+| `prove-truncation <capture.pcap>` | From a wire capture, prove whether the producer truncates request bodies (sends fewer bytes than its `Content-Length`). `PORT=`, `LABEL=` |
 | `summary` | High-level analytics: counts, reply rate, batches, latency, top methods, errors |
 | `latency` | Per-method p50/p95/p99/avg/max, singleton flows only |
 | `latency-batch` | Per-flow latency for batched requests, by bucket and by method |
