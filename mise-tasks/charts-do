@@ -1,0 +1,158 @@
+#!/usr/bin/env python
+#MISE description="Render the parquet + server-resource chart: a node-vs-node load-over-time overlay — server CPU/mem over the same observation window, one clock. Args: <node-a.parquet> <node-b.parquet> [out_dir=charts]. Run fetch-do first."
+
+import sys
+from pathlib import Path
+from statistics import mean
+
+# This task lives in mise-tasks/, but the chart toolkit (chart_kit) and the data
+# layers (do_metrics, rpc_queries) live in the repo root. Put the root on sys.path
+# so the imports resolve whether mise runs this file or it's run directly.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import altair as alt
+import pandas as pd
+
+import do_metrics as dm
+import rpc_queries as rq
+from chart_kit import (
+    MUTED, GREEN, FAINT,
+    style, save, per_flow, date_label, node_legend,
+)
+
+# Resource charts keep the slightly larger title styling the deck has always used.
+RES = dict(title_size=20, sub_size=13, sub_pad=8)
+
+
+def parquet_span(path):
+    """`(t0, span_hours)` for a parquet, from its first/last request."""
+    pf = per_flow(path)
+    t0 = float(pf["ts_start"].min())
+    return t0, (float(pf["ts_start"].max()) - t0) / 3600
+
+
+# ========= both nodes under load, one clock (coalesces the two per-node timelines)
+def load_compare(bp, ap, bw, aw):
+    """Both nodes' "under real load" stories in ONE chart: server CPU and
+    memory while serving the workload — each panel overlays the two nodes on
+    the same elapsed-hours clock, over the SAME observation window (the first
+    N hours of each run, N = the shorter run; the workloads mirror each other,
+    so equal hours = comparable load, and neither line nor its average covers
+    time the other can't answer for). Each panel's title carries the delta as
+    an ABSOLUTE gap (cores / GB), never a % (reviewer rule). No demand panel
+    (the reader assumes a fair comparison), no latency panel (it has its own
+    per-flow/per-call charts), and no disk panel (the server also stores
+    unrelated files, some removed between the runs, so whole-server disk
+    movement says nothing about either node)."""
+    runs = []
+    for path, w, full in ((bp, bw, A_FULL), (ap, aw, B_FULL)):
+        pf = per_flow(path)
+        runs.append((w, float(pf["ts_start"].min()), float(pf["ts_start"].max()), full))
+    span = min((t1 - t0) / 3600 for w, t0, t1, full in runs)
+    frames = {"cpu": [], "mem": []}
+    stats = {}
+    for w, t0, _t1, full in runs:
+        end = t0 + span * 3600
+        for key, overlay in (("cpu", dm.cpu_overlay(w, t0)), ("mem", dm.mem_overlay(w, t0))):
+            d = overlay[(overlay["hour"] >= 0) & (overlay["hour"] <= span)].copy()
+            d["node_label"] = full
+            frames[key].append(d)
+        clip = lambda s: [v for t, v in s if t0 <= t <= end]
+        stats[full] = dict(cpu=mean(clip(dm.cpu_series(w))), mem=mean(clip(dm.mem_series(w))))
+    sa, sb = stats[A_FULL], stats[B_FULL]
+    cores = dm.cpu_stats(bw)["cores"]
+    total = dm.mem_stats(bw)["total"]
+    # The headline deltas, in real units: how many CPU cores and how many GB of
+    # RAM the after node needs less (or more) than the before node on average.
+    cpu_d = sb["cpu"] - sa["cpu"]
+    cores_d = cpu_d / 100 * cores
+    mem_d = sb["mem"] - sa["mem"]
+    colour = node_legend([B_FULL, A_FULL], [GREEN, FAINT])   # our node leads the legend
+
+    # Stacked panels sharing the elapsed-hours axis; each keeps its OWN y-scale.
+    def panel(key, field, title, height, *, bottom=False):
+        df = pd.concat(frames[key], ignore_index=True)
+        return alt.Chart(df).mark_line(strokeWidth=2).encode(
+            x=alt.X("hour:Q", scale=alt.Scale(nice=False, domain=[0, span]),
+                    title="hours elapsed" if bottom else None,
+                    axis=alt.Axis(labels=bottom, ticks=bottom, grid=False)),
+            y=alt.Y(f"{field}:Q", title=None, scale=alt.Scale(zero=True)),
+            color=colour,
+        ).properties(width=760, height=height, title=alt.TitleParams(
+            text=title, anchor="start", fontSize=12.5, fontWeight=700, color=MUTED, dy=-2))
+
+    chart = alt.vconcat(
+        panel("cpu", "cpu",
+              f"server CPU used (%) — {cores} cores · avg {B_LBL} {sb['cpu']:.0f}% vs {A_LBL} {sa['cpu']:.0f}% "
+              f"({abs(cores_d):.1f} cores {'fewer' if cpu_d < 0 else 'more'})",
+              105),
+        panel("mem", "mem",
+              f"server memory used (GB) — of {total:.0f} GB · avg {B_LBL} {sb['mem']:.1f} GB vs {A_LBL} {sa['mem']:.1f} GB "
+              f"({abs(mem_d):.1f} GB {'less' if mem_d < 0 else 'more'})",
+              105, bottom=True),
+        spacing=12,
+    ).resolve_scale(color="shared")
+    return style(chart, f"Under real load — {B_LBL} vs {A_LBL}",
+                 f"what serving the same workload cost the server — "
+                 f"the first {span:.0f} hours of each run, on one clock", **RES)
+
+
+# ============================================================ render
+USAGE = "usage: mise run charts-do <node-a.parquet> <node-b.parquet> [out_dir=charts]"
+if len(sys.argv) < 3:
+    sys.exit(USAGE)
+before_path, after_path = sys.argv[1], sys.argv[2]
+for p in (before_path, after_path):
+    if not Path(p).is_file():
+        sys.exit(f"parquet not found: {p}\n{USAGE}")
+out = Path(sys.argv[3] if len(sys.argv) > 3 else "charts")
+out.mkdir(parents=True, exist_ok=True)
+BEFORE_LBL = date_label(before_path)
+AFTER_LBL = date_label(after_path)
+
+bt0, bspan = parquet_span(before_path)
+at0, aspan = parquet_span(after_path)
+bw = dm.window_for(bt0, bspan)
+aw = dm.window_for(at0, aspan)
+missing = [f"{Path(p).name} ({lbl})"
+           for p, win, lbl in ((before_path, bw, BEFORE_LBL), (after_path, aw, AFTER_LBL))
+           if win is None]
+if missing:
+    have = ", ".join(dm.windows()) or "none"
+    sys.exit(f"no server-metrics window overlaps {' and '.join(missing)} — "
+             f"do-metrics/ has [{have}]. Pick runs that overlap a fetched window "
+             f"(e.g. the may22→may26 baseline), or run `mise run fetch-do <parquet>` first "
+             f"(note: metric retention may not reach runs more than ~a month old).")
+
+# A window can exist but be incomplete (fetch-do logs per-metric HTTP failures and
+# keeps going) — check the files this script actually reads before rendering, so a
+# partial fetch fails with a re-run hint instead of a FileNotFoundError traceback.
+need = [f"{w}__{m}.json" for w in dict.fromkeys((bw, aw))
+        for m in ("cpu", "memory_total", "memory_available")]
+absent = [n for n in need if not (Path(dm.DIR) / n).exists()]
+if absent:
+    sys.exit("server-metrics files missing for the matched window(s): "
+             + ", ".join(absent)
+             + " — the fetch was incomplete; re-run `mise run fetch-do <parquet>`.")
+
+# Warn (don't fail) if a run's clock range is only partly spanned by server-metric
+# samples — measured as covered span / run span, so it's independent of the
+# (range-dependent) sample cadence.
+for tag, p, t0, span, w in [("before", before_path, bt0, bspan, bw),
+                            ("after", after_path, at0, aspan, aw)]:
+    inside = [t for t, _ in dm.cpu_series(w) if t0 <= t <= t0 + span * 3600]
+    cov = (max(inside) - min(inside)) / (span * 3600) if len(inside) > 1 else 0.0
+    if cov < 0.9:
+        print(f"  note: {tag} run only ~{cov*100:.0f}% spanned by server-metrics window '{w}' "
+              f"(metric retention may not reach that far back)", file=sys.stderr)
+
+A = rq.node_identity(before_path)
+B = rq.node_identity(after_path)
+A_LBL, B_LBL = A["agent"], B["agent"]
+if A_LBL == B_LBL:                        # same agent (two builds) -> disambiguate by commit
+    A_LBL, B_LBL = f"{A['agent']} {A['commit'][:7]}", f"{B['agent']} {B['commit'][:7]}"
+A_FULL, B_FULL = A["label"], B["label"]   # agent + version, for the node colour legend
+
+print(f"A = {A['label']} ({bw})   B = {B['label']} ({aw})   ->  {out}")
+save(load_compare(before_path, after_path, bw, aw), out / "load-over-time.png")
+print("done")

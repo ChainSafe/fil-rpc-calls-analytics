@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Fetch DigitalOcean metrics aligned to each capture into do-metrics/. Args: <parquet>... Token via DIGITALOCEAN_TOKEN env or --token."
+set -euo pipefail
+
+python fetch_do.py "$@"
