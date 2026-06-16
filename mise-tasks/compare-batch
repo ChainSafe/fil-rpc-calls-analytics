@@ -1,22 +1,35 @@
 #!/usr/bin/env python
-#MISE description="Batch efficiency diff between two parquet files (args: <before.parquet> <after.parquet>)"
+#MISE description="Batch efficiency diff between two parquet files (args: <before.parquet> <after.parquet> [--exclude=m1,m2])"
 
 import sys
 import polars as pl
 
-if len(sys.argv) < 3:
-    print("usage: mise run compare-batch <before.parquet> <after.parquet>", file=sys.stderr)
+# --exclude=eth_estimateGas,eth_call (repeatable, comma-separated) drops those
+# methods before aggregation; a batch made entirely of excluded methods vanishes,
+# while a mixed batch keeps its original wall-time. Nothing excluded by default.
+excluded: list[str] = []
+positional: list[str] = []
+for arg in sys.argv[1:]:
+    if arg.startswith("--exclude=") or arg.startswith("-x="):
+        excluded += [m.strip() for m in arg.split("=", 1)[1].split(",") if m.strip()]
+    else:
+        positional.append(arg)
+
+if len(positional) < 2:
+    print("usage: mise run compare-batch <before.parquet> <after.parquet> [--exclude=m1,m2]", file=sys.stderr)
     sys.exit(2)
 
-before_path = sys.argv[1]
-after_path = sys.argv[2]
+before_path = positional[0]
+after_path = positional[1]
 
 
 def flow_table(path: str) -> pl.DataFrame:
     """One row per batched flow with duration and per-call amortized cost."""
+    lf = pl.scan_parquet(path)
+    if excluded:
+        lf = lf.filter(~pl.col("method").is_in(excluded))
     return (
-        pl.scan_parquet(path)
-          .filter(pl.col("batch_size") > 1)
+        lf.filter(pl.col("batch_size") > 1)
           .group_by("flow_id")
           .agg(
               pl.col("batch_size").first(),
@@ -90,5 +103,7 @@ b = flow_table(after_path)
 
 print(f"before: {before_path}   batched flows: {a.height}")
 print(f"after:  {after_path}   batched flows: {b.height}")
+if excluded:
+    print(f"excluded methods: {', '.join(excluded)}")
 render("Per-flow duration (ms) — wall time for the whole batch", "duration_ms", a, b)
 render("Per-call amortized (ms) — duration_ms / batch_size", "per_call_ms", a, b)

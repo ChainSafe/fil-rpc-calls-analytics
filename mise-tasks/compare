@@ -1,23 +1,43 @@
 #!/usr/bin/env python
-#MISE description="Per-method latency diff between two parquet files (args: <before.parquet> <after.parquet> [top_n] [sort])"
+#MISE description="Per-method latency diff between two parquet files (args: <before.parquet> <after.parquet> [top_n] [sort] [--exclude=m1,m2] [--reweight])"
 
 import sys
 import polars as pl
 
-if len(sys.argv) < 3:
-    print("usage: mise run compare <before.parquet> <after.parquet> [top_n=30] [sort=n|p50|p95|p99|mean]",
+# --exclude=eth_estimateGas,eth_call  (repeatable, comma-separated) drops those
+# methods before any aggregation. Nothing is excluded by default.
+# --reweight  adds mix-normalized overall blocks: both files are re-weighted to a
+# shared (pooled) method mix so the overall difference reflects per-method speed,
+# not which file happened to receive more of the slow methods. Off by default.
+excluded: list[str] = []
+reweight = False
+positional: list[str] = []
+for arg in sys.argv[1:]:
+    if arg.startswith("--exclude=") or arg.startswith("-x="):
+        excluded += [m.strip() for m in arg.split("=", 1)[1].split(",") if m.strip()]
+    elif arg in ("--reweight", "-r"):
+        reweight = True
+    else:
+        positional.append(arg)
+
+if len(positional) < 2:
+    print("usage: mise run compare <before.parquet> <after.parquet> [top_n=30] [sort=n|p50|p95|p99|mean] [--exclude=m1,m2] [--reweight]",
           file=sys.stderr)
     sys.exit(2)
 
-before_path = sys.argv[1]
-after_path = sys.argv[2]
-top_n = int(sys.argv[3]) if len(sys.argv) > 3 else 30
-sort_key = sys.argv[4] if len(sys.argv) > 4 else "n"
+before_path = positional[0]
+after_path = positional[1]
+top_n = int(positional[2]) if len(positional) > 2 else 30
+sort_key = positional[3] if len(positional) > 3 else "n"
+
+
+def drop_excluded(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf.filter(~pl.col("method").is_in(excluded)) if excluded else lf
 
 
 def summarise(path: str) -> pl.DataFrame:
     return (
-        pl.scan_parquet(path)
+        drop_excluded(pl.scan_parquet(path))
           .filter(pl.col("batch_size") == 1)
           .group_by("method")
           .agg(
@@ -75,24 +95,26 @@ def render(title: str, metric: str, sub: pl.DataFrame) -> None:
 print(f"before: {before_path}")
 print(f"after:  {after_path}")
 print(f"sort:   {sort_key}   top_n: {top_n}")
+if excluded:
+    print(f"excluded methods: {', '.join(excluded)}")
 
 
 def overall(path: str) -> dict:
-    df = pl.scan_parquet(path).filter(pl.col("duration_ms").is_not_null())
+    df = drop_excluded(pl.scan_parquet(path)).filter(pl.col("duration_ms").is_not_null())
     flow = df.unique(subset=["flow_id"])
     f = flow.select(
         pl.col("duration_ms").mean().alias("avg"),
-        pl.col("duration_ms").quantile(0.5).alias("p50"),
-        pl.col("duration_ms").quantile(0.95).alias("p95"),
-        pl.col("duration_ms").quantile(0.99).alias("p99"),
+        pl.col("duration_ms").quantile(0.5, interpolation="lower").alias("p50"),
+        pl.col("duration_ms").quantile(0.95, interpolation="lower").alias("p95"),
+        pl.col("duration_ms").quantile(0.99, interpolation="lower").alias("p99"),
     ).collect().row(0)
     c = df.with_columns(
         (pl.col("duration_ms") / pl.col("batch_size")).alias("per_call_ms")
     ).select(
         pl.col("per_call_ms").mean().alias("avg"),
-        pl.col("per_call_ms").quantile(0.5).alias("p50"),
-        pl.col("per_call_ms").quantile(0.95).alias("p95"),
-        pl.col("per_call_ms").quantile(0.99).alias("p99"),
+        pl.col("per_call_ms").quantile(0.5, interpolation="lower").alias("p50"),
+        pl.col("per_call_ms").quantile(0.95, interpolation="lower").alias("p95"),
+        pl.col("per_call_ms").quantile(0.99, interpolation="lower").alias("p99"),
     ).collect().row(0)
     return {"flow": f, "call": c}
 
@@ -108,10 +130,100 @@ def render_overall(title: str, kind: str, dp: int):
         print(f"  {label:<6}  {bv:>10.{dp}f}  {av:>10.{dp}f}  {d:>+10.{dp}f}  {pct:>+6.1f}%")
 
 
+# ---- mix-normalized (re-weighted) overall ------------------------------------
+# The raw blocks above mix all methods together, so they reflect both per-method
+# speed AND how much of each method a file happened to receive. To compare engines
+# fairly we re-weight every file toward the pooled method mix of both files, so the
+# overall difference reflects per-method speed alone.
+#
+# NB: methods present in only one file can't be equalized — each file is normalized
+# over its OWN method set, so the mix matches exactly only for methods common to
+# both. Drop one-sided methods with --exclude if they distort the comparison.
+#
+# Per-call uses the method on each row. Per-flow needs one method per flow; for a
+# batched flow we use its first call's method (94% of batches are single-method,
+# and single-call flows dominate the count), so it's a close approximation.
+#
+# Quantiles here use the 'lower' (inverted-CDF) estimator; overall() below uses the
+# same so the raw and normalized blocks are compared like-for-like.
+
+def per_flow_frame(path: str) -> pl.DataFrame:
+    return (
+        drop_excluded(pl.scan_parquet(path))
+          .filter(pl.col("duration_ms").is_not_null())
+          .group_by("flow_id")
+          .agg(
+              pl.col("duration_ms").first().alias("v"),
+              pl.col("method").sort_by("position").first().alias("method"),
+          )
+          .collect()
+    )
+
+
+def per_call_frame(path: str) -> pl.DataFrame:
+    return (
+        drop_excluded(pl.scan_parquet(path))
+          .filter(pl.col("duration_ms").is_not_null())
+          .select(
+              pl.col("method"),
+              (pl.col("duration_ms") / pl.col("batch_size")).alias("v"),
+          )
+          .collect()
+    )
+
+
+def reweighted_stats(df: pl.DataFrame, ref: dict) -> tuple:
+    """Weighted (mean, p50, p95, p99) of df['v'] using shared method shares `ref`.
+
+    Each row's weight = ref_share[method] / file_share[method], so the file's
+    effective method mix becomes `ref`. Quantiles are computed over the weighted
+    empirical distribution (a 'lower' weighted quantile)."""
+    n = df.height
+    if n == 0:
+        return (float("nan"),) * 4
+    fs = {r["method"]: r["len"] / n for r in df.group_by("method").len().iter_rows(named=True)}
+    w_map = {m: ref.get(m, 0.0) / fs[m] for m in fs}
+    df = df.with_columns(pl.col("method").replace_strict(w_map, default=0.0).alias("w"))
+    tot_w = df["w"].sum()
+    mean = (df["w"] * df["v"]).sum() / tot_w
+    s = df.sort("v")
+    cw = s["w"].cum_sum()
+
+    def wq(q: float) -> float:
+        idx = (cw >= q * tot_w).arg_max()  # first index crossing the threshold
+        return s["v"][idx]
+
+    return (mean, wq(0.5), wq(0.95), wq(0.99))
+
+
+def ref_shares(a: pl.DataFrame, b: pl.DataFrame) -> dict:
+    pooled = pl.concat([a.select("method"), b.select("method")])
+    n = pooled.height
+    return {r["method"]: r["len"] / n for r in pooled.group_by("method").len().iter_rows(named=True)}
+
+
+def render_reweighted(title: str, a: tuple, b: tuple, dp: int):
+    print(f"\n== overall {title} (ms, mix-normalized to pooled method mix) ==")
+    print(f"  {'metric':<6}  {'before':>10}  {'after':>10}  {'Δ':>10}  {'Δ%':>7}")
+    for i, label in enumerate(["avg", "p50", "p95", "p99"]):
+        bv, av = a[i], b[i]
+        d = av - bv
+        pct = (d / bv * 100) if bv else 0.0
+        print(f"  {label:<6}  {bv:>10.{dp}f}  {av:>10.{dp}f}  {d:>+10.{dp}f}  {pct:>+6.1f}%")
+
+
 oa = overall(before_path)
 ob = overall(after_path)
 render_overall("per-flow latency", "flow", 1)
 render_overall("per-call amortized (duration/batch_size)", "call", 2)
+
+if reweight:
+    fa, fb = per_flow_frame(before_path), per_flow_frame(after_path)
+    ca, cb = per_call_frame(before_path), per_call_frame(after_path)
+    fref, cref = ref_shares(fa, fb), ref_shares(ca, cb)
+    render_reweighted("per-flow latency", reweighted_stats(fa, fref), reweighted_stats(fb, fref), 1)
+    render_reweighted("per-call amortized (duration/batch_size)",
+                      reweighted_stats(ca, cref), reweighted_stats(cb, cref), 2)
 
 render("mean (ms)", "mean", ranked)
 render("p50 (ms)", "p50", ranked)
