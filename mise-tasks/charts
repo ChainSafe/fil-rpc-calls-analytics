@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-#MISE description="Render the parquet chart deck (all PNG): node-vs-node latency comparison (auto-labelled by version from the data) + single-capture business charts. Args: <node-a.parquet> <node-b.parquet> [top_n=30] [out_dir=charts] (or CHARTS_DIR env)."
+#MISE description="Render the parquet chart deck (all PNG): node-vs-node latency comparison (auto-labelled by version from the data) + single-capture business charts. Args: <node-a.parquet> <node-b.parquet> [top_n=30] [out_dir=charts] [--reweight] (or CHARTS_DIR env)."
 
 import os
 import sys
@@ -22,32 +22,37 @@ from chart_kit import (
 )
 
 
-USAGE = "usage: mise run charts <node-a.parquet> <node-b.parquet> [top_n=30] [out_dir=charts]"
-if len(sys.argv) < 3:
+USAGE = "usage: mise run charts <node-a.parquet> <node-b.parquet> [top_n=30] [out_dir=charts] [--reweight]"
+reweight = False
+positional: list[str] = []
+for arg in sys.argv[1:]:
+    if arg in ("--reweight", "-r"):
+        reweight = True
+    else:
+        positional.append(arg)
+
+if len(positional) < 2:
     sys.exit(USAGE)
 
-before_path = sys.argv[1]
-after_path = sys.argv[2]
+before_path = positional[0]
+after_path = positional[1]
 for p in (before_path, after_path):
     if not Path(p).is_file():
         sys.exit(f"parquet not found: {p}\n{USAGE}")
 try:
-    top_n = int(sys.argv[3]) if len(sys.argv) > 3 else 30
+    top_n = int(positional[2]) if len(positional) > 2 else 30
 except ValueError:
-    sys.exit(f"top_n must be a number, got {sys.argv[3]!r}\n{USAGE}")
-# out_dir: positional arg [4] wins, else CHARTS_DIR env, else "charts"
-out_dir = Path(sys.argv[4] if len(sys.argv) > 4 else os.environ.get("CHARTS_DIR", "charts"))
+    sys.exit(f"top_n must be a number, got {positional[2]!r}\n{USAGE}")
+# out_dir: positional arg [3] wins, else CHARTS_DIR env, else "charts"
+out_dir = Path(positional[3] if len(positional) > 3 else os.environ.get("CHARTS_DIR", "charts"))
 out_dir.mkdir(parents=True, exist_ok=True)
 
-# Identify the two nodes from the captured data (agent + version + commit) so the
-# charts self-label which builds they compare, instead of generic "before/after".
+# Chart labels: full identity for subtitle/legend; short agent names on axes.
 A = rq.node_identity(before_path)   # node behind arg 1
 B = rq.node_identity(after_path)    # node behind arg 2
-A_LBL, B_LBL = A["agent"], B["agent"]            # short axis labels: "Forest" / "Lotus"
-if A_LBL == B_LBL:                               # same agent (two builds) -> disambiguate by commit
-    A_LBL, B_LBL = f"{A['agent']} {A['commit'][:7]}", f"{B['agent']} {B['commit'][:7]}"
-VERSUS = f"{A['label']}   vs   {B['label']}"     # agent + version (no commit), for subtitles
-A_FULL, B_FULL = A["label"], B["label"]          # agent + version, for the node colour legend
+A_AXIS, B_AXIS = A["agent"], B["agent"]          # Lotus / Forest — x-axis only
+A_FULL, B_FULL = A["label"], B["label"]          # Lotus: v1.36.1-dev / Forest: date-hash
+VERSUS = f"{B_FULL} vs {A_FULL}"
 
 BEFORE_LBL = date_label(before_path)
 AFTER_LBL = date_label(after_path)
@@ -69,68 +74,52 @@ METRICS = ("avg", "p50", "p95", "p99")
 Y_CAPS = {"avg": 1000, "p50": 100, "p95": 1500, "p99": 15_000}
 
 
-def latencies(path: str) -> dict[str, dict[str, float]]:
-    df = pl.scan_parquet(path).filter(pl.col("duration_ms").is_not_null())
-    flow = df.unique(subset=["flow_id"])
-    f = flow.select(
-        pl.col("duration_ms").mean().alias("avg"),
-        pl.col("duration_ms").quantile(0.5, interpolation="linear").alias("p50"),
-        pl.col("duration_ms").quantile(0.95, interpolation="linear").alias("p95"),
-        pl.col("duration_ms").quantile(0.99, interpolation="linear").alias("p99"),
-    ).collect().row(0, named=True)
-    c = df.with_columns(
-        (pl.col("duration_ms") / pl.col("batch_size")).alias("per_call_ms")
-    ).select(
-        pl.col("per_call_ms").mean().alias("avg"),
-        pl.col("per_call_ms").quantile(0.5, interpolation="linear").alias("p50"),
-        pl.col("per_call_ms").quantile(0.95, interpolation="linear").alias("p95"),
-        pl.col("per_call_ms").quantile(0.99, interpolation="linear").alias("p99"),
-    ).collect().row(0, named=True)
-    return {"per-flow": f, "per-call amortized": c}
+def _stats_dict(t: tuple) -> dict[str, float]:
+    return {"avg": t[0], "p50": t[1], "p95": t[2], "p99": t[3]}
 
 
-a = latencies(before_path)
-b = latencies(after_path)
+if reweight:
+    fa, fb = rq.per_flow_frame(before_path), rq.per_flow_frame(after_path)
+    ca, cb = rq.per_call_frame(before_path), rq.per_call_frame(after_path)
+    fref, cref = rq.ref_shares(fa, fb), rq.ref_shares(ca, cb)
+    a = {"per-flow": _stats_dict(rq.reweighted_stats(fa, fref)),
+         "per-call amortized": _stats_dict(rq.reweighted_stats(ca, cref))}
+    b = {"per-flow": _stats_dict(rq.reweighted_stats(fb, fref)),
+         "per-call amortized": _stats_dict(rq.reweighted_stats(cb, cref))}
+else:
+    a = rq.overall_latency(before_path)
+    b = rq.overall_latency(after_path)
 
 rows = []
 for view in ("per-flow", "per-call amortized"):
     for metric in METRICS:
-        rows.append({"view": view, "metric": metric, "phase": A_LBL,
+        rows.append({"view": view, "metric": metric, "phase": A_AXIS,
                      "node_label": A_FULL, "ms": a[view][metric]})
-        rows.append({"view": view, "metric": metric, "phase": B_LBL,
+        rows.append({"view": view, "metric": metric, "phase": B_AXIS,
                      "node_label": B_FULL, "ms": b[view][metric]})
 data = pl.DataFrame(rows).to_pandas()
 
 
 def _delta_label(a_ms: float, b_ms: float, *, tie: bool = False) -> str:
-    """The gap between the two bars in real time units — '560 ms faster',
-    '6.3 ms slower', '13.5 s faster' — absolute, never a % (reviewer rule).
-    `tie` (the caller derives it from the colour dead band, keeping one source
-    of truth) renders as '≈ even (57 ms)' so the words can't claim a win the
-    colour just called a coin-flip."""
+    """Absolute gap in real time units — never a % (reviewer rule)."""
     d = b_ms - a_ms
     mag = abs(d)
-    txt = (f"{mag / 1000:.1f} s" if mag >= 1000
-           else f"{mag:.0f} ms" if mag >= 10 else f"{mag:.1f} ms")
+    txt = (f"{mag / 1000:.2f} s" if mag >= 1000
+           else f"{mag:.2f} ms")
     if tie:
-        return f"≈ even ({txt})"
+        return f"≈ equivalent ({txt})"
     return f"{txt} {'faster' if d < 0 else 'slower'}"
 
 
 def render(view: str, filename: str, title: str) -> None:
     sub = data[data["view"] == view].copy()
 
-    # One colour per node (user's final call after trying per-panel verdict
-    # colours): Lotus is the grey baseline and Forest wears its identity green
-    # on EVERY panel — including p50, which Lotus wins. The bar heights and ms
-    # labels carry that truth; a red bar shouted "slow" louder than the deck
-    # wants. Green only flips if the OVERALL verdict (median across metrics)
-    # regresses. Each panel carries its delta as the x-axis title (Vega centres
-    # it) — an ABSOLUTE gap in real time units, never a %.
+    # Baseline node grey; compared node green unless overall median regresses.
+    # Panel x-axis title carries the absolute delta (Vega centres it).
     d_values, deltas = [], {}
     for metric in METRICS:
-        a_ms = sub[(sub.metric == metric) & (sub.phase == A_LBL)]["ms"].iloc[0]
-        b_ms = sub[(sub.metric == metric) & (sub.phase == B_LBL)]["ms"].iloc[0]
+        a_ms = sub[(sub.metric == metric) & (sub.phase == A_AXIS)]["ms"].iloc[0]
+        b_ms = sub[(sub.metric == metric) & (sub.phase == B_AXIS)]["ms"].iloc[0]
         d_values.append((b_ms - a_ms) / a_ms * 100 if a_ms else 0.0)
         col = colour_lower_better(a_ms, b_ms)
         deltas[metric] = {"label": _delta_label(a_ms, b_ms, tie=col == NEUTRAL),
@@ -145,7 +134,7 @@ def render(view: str, filename: str, title: str) -> None:
         cap = Y_CAPS[metric]
         top = float(m["ms"].max())
         base = alt.Chart(m).encode(
-            x=alt.X("phase:N", sort=[B_LBL, A_LBL],   # Forest (ours) first, then the baseline
+            x=alt.X("phase:N", sort=[B_AXIS, A_AXIS],
                     axis=alt.Axis(title=deltas[metric]["label"],
                                   titleColor=deltas[metric]["colour"],
                                   titleFontSize=12.5, titleFontWeight=600,
@@ -156,10 +145,10 @@ def render(view: str, filename: str, title: str) -> None:
         )
         bars = base.mark_bar(size=42).encode(
             color=node_legend([B_FULL, A_FULL], [after_color, FAINT]),
-            tooltip=["metric", "phase", alt.Tooltip("ms:Q", format=".1f")],
+            tooltip=["metric", "phase", "node_label", alt.Tooltip("ms:Q", format=".2f")],
         )
         labels = base.mark_text(dy=-6, fontSize=11).encode(
-            text=alt.Text("ms:Q", format=".1f"),
+            text=alt.Text("ms:Q", format=".2f"),
         )
         return (bars + labels).properties(width=170, height=280, title=alt.TitleParams(
             text=metric, anchor="middle", fontSize=13, fontWeight="normal", color=INK))
@@ -168,25 +157,12 @@ def render(view: str, filename: str, title: str) -> None:
         alt.hconcat(*[panel(m) for m in METRICS], spacing=40)
            .resolve_scale(color="shared")
            .properties(title=alt.TitleParams(
-               text=title, subtitle="lower is better · each panel has its own scale",
+               text=title,
+               subtitle=f"lower is better · each panel has its own scale"
+                        + (" · mix-normalized to pooled method mix" if reweight else ""),
                subtitleFontSize=11, subtitleColor="#555"))
     )
     save(chart, out_dir / filename)
-
-
-def per_method(path: str) -> pl.DataFrame:
-    """Per-method latency on singleton flows (matches the `compare` task)."""
-    return (
-        pl.scan_parquet(path)
-          .filter(pl.col("batch_size") == 1)
-          .group_by("method")
-          .agg(
-              pl.len().alias("n"),
-              pl.col("duration_ms").mean().alias("mean"),
-              pl.col("duration_ms").quantile(0.95, interpolation="linear").alias("p95"),
-          )
-          .collect()
-    )
 
 
 def _human(n: float) -> str:
@@ -199,17 +175,8 @@ def _human(n: float) -> str:
 
 
 def render_method(table: pl.DataFrame) -> None:
-    """Three aligned dumbbell panels per method — call volume, mean latency and
-    p95 latency. Every row reads left-to-right as Lotus (grey) → Forest, where
-    Forest greens if it's faster and reds if it's slower; the call-volume panel is
-    neutral blue since volume is neither a win nor a loss. Log x-scales keep the
-    wide value ranges readable. The label on each latency row is Forest's change
-    vs Lotus as a percent (− = faster), which reads more clearly than a raw
-    millisecond difference."""
-    import pandas as pd
-
-    # Log axes can't plot null/zero, so keep methods present in both runs. A
-    # method with a latency in both files also has n_a > 0 and n_b > 0.
+    """Three dumbbell panels per method: calls, mean, p95 (log x-scale)."""
+    # Log axes can't plot null/zero — keep methods present in both runs.
     base = table.filter(
         pl.col("mean_a").is_not_null() & pl.col("mean_b").is_not_null()
     )
@@ -220,11 +187,8 @@ def render_method(table: pl.DataFrame) -> None:
         ("mean (ms)", "mean_a", "mean_b", "ms"),
         ("p95 (ms)",  "p95_a",  "p95_b",  "ms"),
     ]
-    # The colour series double as the legend (auto-built from these labels):
-    # Lotus is the grey baseline; Forest greens when faster, reds when slower;
-    # call volume is neutral blue.
-    S_LOTUS, S_FAST, S_SLOW, S_VOL = A_FULL, f"{B_FULL} faster", f"{B_FULL} slower", "call volume"
-    series_domain = [S_FAST, S_SLOW, S_LOTUS, S_VOL]   # Forest's entries lead the legend
+    S_LOTUS, S_FAST, S_SLOW, S_VOL = A_AXIS, f"{B_AXIS} faster", f"{B_AXIS} slower", "call volume"
+    series_domain = [S_FAST, S_SLOW, S_LOTUS, S_VOL]
 
     rows = []
     for panel, ca, cb, kind in panels:
@@ -239,12 +203,10 @@ def render_method(table: pl.DataFrame) -> None:
                 label = f"{pct:+.0f}%"
                 after_series = S_FAST if pct < 0 else S_SLOW
                 lbl_color = GREEN if pct < 0 else RED
-            # before (Lotus) is always the grey baseline; the after (Forest) dot
-            # carries the verdict (or neutral volume).
-            rows.append({"method": r["method"], "panel": panel, "phase": A_LBL,
+            rows.append({"method": r["method"], "panel": panel, "phase": A_AXIS,
                          "value": bef, "before": bef, "after": aft,
                          "series": S_LOTUS, "label": None, "lbl_color": None})
-            rows.append({"method": r["method"], "panel": panel, "phase": B_LBL,
+            rows.append({"method": r["method"], "panel": panel, "phase": B_AXIS,
                          "value": aft, "before": bef, "after": aft,
                          "series": after_series, "label": label, "lbl_color": lbl_color})
 
@@ -253,7 +215,7 @@ def render_method(table: pl.DataFrame) -> None:
     y = alt.Y("method:N", sort=order, title=None,
               axis=alt.Axis(labelLimit=320, labelFontSize=11))
     logx = alt.Scale(type="log")
-    after_only = alt.datum.phase == B_LBL
+    after_only = alt.datum.phase == B_AXIS
     color_enc = alt.Color("series:N", sort=series_domain,
                           scale=alt.Scale(domain=series_domain, range=[GREEN, RED, GREY, NEUTRAL]),
                           legend=alt.Legend(title=None, orient="bottom"))
@@ -280,61 +242,23 @@ def render_method(table: pl.DataFrame) -> None:
                   spacing=46)
            .resolve_scale(x="independent")
            .properties(title=alt.TitleParams(
-               text=f"Per-method latency — {B_LBL} vs {A_LBL} (top {top_n} by calls)",
-               subtitle="each row: Lotus → Forest · % = Forest's latency vs Lotus (− faster, + slower) · calls panel = volume",
+               text=f"Per-method latency — {B_AXIS} vs {A_AXIS} (top {top_n} by calls)",
+               subtitle=f"{VERSUS} · each row: {A_AXIS} → {B_AXIS} · % = {B_AXIS}'s latency vs {A_AXIS} (− faster, + slower) · calls panel = volume",
                subtitleFontSize=11, subtitleColor="#555"))
     )
     save(chart, out_dir / "latency-per-method.png")
 
 
-BUCKETS = ["2-10", "11-50", "51-99", "100+"]
-
-
-def batch_table(path: str) -> pl.DataFrame:
-    return (
-        pl.scan_parquet(path)
-          .filter(pl.col("batch_size") > 1)
-          .group_by("flow_id")
-          .agg(
-              pl.col("batch_size").first(),
-              pl.col("duration_ms").first(),
-          )
-          .with_columns(
-              (pl.col("duration_ms") / pl.col("batch_size")).alias("per_call_ms"),
-              pl.when(pl.col("batch_size") <= 10).then(pl.lit("2-10"))
-                .when(pl.col("batch_size") <= 50).then(pl.lit("11-50"))
-                .when(pl.col("batch_size") <= 99).then(pl.lit("51-99"))
-                .otherwise(pl.lit("100+"))
-                .alias("bucket"),
-          )
-          .collect()
-    )
-
-
-def batch_summary(path: str, col: str) -> pl.DataFrame:
-    return (
-        batch_table(path)
-          .group_by("bucket")
-          .agg(
-              pl.len().alias("flows"),
-              pl.col(col).mean().alias("avg"),
-              pl.col(col).quantile(0.5, interpolation="linear").alias("p50"),
-              pl.col(col).quantile(0.95, interpolation="linear").alias("p95"),
-          )
-    )
+def _batch_summary(path: str, col: str) -> pl.DataFrame:
+    return rq.summarise_buckets(rq.batch_flows(path), col).rename({"mean": "avg"})
 
 
 def render_batch(col: str, filename: str, title: str) -> None:
-    """Horizontal dumbbells: bucket on y, latency on x (avg, p50 and p95). The
-    before node (A) is the grey baseline; the after node (B) carries the verdict
-    colour. Each rule's label is the gap in real time units ("3.1 s faster"),
-    never a % (reviewer rule)."""
-    import pandas as pd
-
-    sa = batch_summary(before_path, col)
-    sb = batch_summary(after_path, col)
+    """Horizontal dumbbells by batch bucket (avg/p50/p95). Absolute delta labels."""
+    sa = _batch_summary(before_path, col)
+    sb = _batch_summary(after_path, col)
     rows, y_order, deltas = [], [], []
-    for bucket in BUCKETS:
+    for bucket in rq.BATCH_BUCKETS:
         ra = sa.filter(pl.col("bucket") == bucket)
         rb = sb.filter(pl.col("bucket") == bucket)
         if ra.is_empty() or rb.is_empty():
@@ -344,25 +268,27 @@ def render_batch(col: str, filename: str, title: str) -> None:
         y_order.append(f"({_human(fa)}→{_human(fb)} flows)  {bucket}")
         for metric in ("avg", "p50", "p95"):
             bef, aft = ra[metric], rb[metric]
+            if bef is None or aft is None:
+                continue
             deltas.append(aft - bef)
             label_fill = colour_lower_better(bef, aft)  # per-bucket Δ colour
             lbl = _delta_label(bef, aft, tie=label_fill == NEUTRAL)
             lx = (bef * aft) ** 0.5
             bl = y_order[-1]
-            for phase, value, node_full in ((A_LBL, bef, A_FULL), (B_LBL, aft, B_FULL)):
+            for phase, value, node_full in ((A_AXIS, bef, A_FULL), (B_AXIS, aft, B_FULL)):
                 rows.append({"bucket": bucket, "bucket_label": bl, "metric": metric,
                              "phase": phase, "value": value,
                              "before": bef, "after": aft,
                              "flows_a": fa, "flows_b": fb,
                              "node_label": node_full,
-                             "label": lbl if phase == B_LBL else None,
-                             "label_x": lx if phase == B_LBL else None,
-                             "label_color": label_fill if phase == B_LBL else None})
+                             "label": lbl if phase == B_AXIS else None,
+                             "label_x": lx if phase == B_AXIS else None,
+                             "label_color": label_fill if phase == B_AXIS else None})
 
     long = pd.DataFrame(rows)
     overall = float(np.median(deltas)) if deltas else 0.0
     after_color = GREEN if overall < 0 else RED if overall > 0 else FAINT
-    after_only = alt.datum.phase == B_LBL
+    after_only = alt.datum.phase == B_AXIS
     y = alt.Y("bucket_label:N", sort=y_order, title="batch size bucket",
               axis=alt.Axis(labelFontSize=11, titlePadding=8))
     logx = alt.Scale(type="log")
@@ -373,7 +299,7 @@ def render_batch(col: str, filename: str, title: str) -> None:
     points = alt.Chart(long).mark_point(filled=True, size=80).encode(
         y=y, x=alt.X("value:Q", scale=logx),
         color=node_legend([B_FULL, A_FULL], [after_color, FAINT]),
-        tooltip=["bucket", "metric", "phase",
+        tooltip=["bucket", "metric", "phase", "node_label",
                  alt.Tooltip("flows_a:Q", title="flows_a", format=","),
                  alt.Tooltip("flows_b:Q", title="flows_b", format=","),
                  alt.Tooltip("value:Q", format=".1f")])
@@ -392,7 +318,7 @@ def render_batch(col: str, filename: str, title: str) -> None:
            .resolve_scale(x="independent")
            .properties(title=alt.TitleParams(
                text=title,
-               subtitle="lower is better · batched requests only, by batch size · log scale",
+               subtitle=f"lower is better · batched requests only, by batch size · log scale",
                subtitleFontSize=10, subtitleColor="#555"))
     )
     save(chart, out_dir / filename)
@@ -400,10 +326,7 @@ def render_batch(col: str, filename: str, title: str) -> None:
 
 # ==================================================== reliability hero (deck opener)
 def reliability_hero():
-    """Bold opener: scale + reliability under real load as two big numbers over a
-    full "answered" bar — not a stat grid. The supporting figures ride in one thin
-    strip underneath so the eye lands on "millions of calls, all answered" first.
-    """
+    """Deck opener: call volume + answered rate as hero numbers."""
     head = rq.headline(after_path)
     lf = pl.scan_parquet(after_path)
     total = head["calls"]
@@ -451,14 +374,7 @@ def reliability_hero():
 
 # ============================ batching: most of the load, far cheaper per call
 def batching_chart():
-    """Two aligned panels by batch size: how many calls each carries (most ride
-    in big batches) and what each call costs (far less in a batch).
-
-    Baseline is eth_call ALONE vs eth_call IN A BATCH — apples to apples, because
-    batches are ~99% eth_call and an eth_call genuinely costs ~41 ms on its own
-    (it executes the EVM). Merges the old batch-scorecard (the 84%-of-calls fact)
-    and batch-savings (the per-call cost), dropping the confounded before/after.
-    """
+    """Call volume vs per-call cost by batch size (eth_call alone as baseline)."""
     dist = {r["bucket"]: r for r in rq.batch_distribution(after_path).iter_rows(named=True)}
     total = sum(r["calls"] for r in dist.values())
     cost = {r["bucket"]: r["mean"] for r in
@@ -506,20 +422,22 @@ def batching_chart():
     bcalls = sum(dist.get(b, {}).get("calls", 0) for b in keys[1:])
     breqs = sum(dist.get(b, {}).get("flows", 0) for b in keys[1:])
     treqs = sum(r["flows"] for r in dist.values())
-    big = cost["100+"]
+    big = cost.get("100+")
+    hundred = dist.get("100+", {})
+    subtitle = (f"batches are {breqs / treqs * 100:.0f}% of requests but carry "
+                f"{bcalls / total * 100:.0f}% of all calls")
+    if big is not None and eth_alone is not None:
+        subtitle += (f" · an eth_call costs ~{eth_alone:.0f} ms alone but ~{big:.0f} ms in a 100+ batch "
+                     f"({eth_alone / big:.0f}× cheaper)")
+        if hundred.get("calls"):
+            subtitle += f", where {hundred['calls'] / total * 100:.0f}% of calls ride"
     return style(chart, "Batching: most of the load rides in batches — and costs far less per call",
-                 f"batches are {breqs / treqs * 100:.0f}% of requests but carry {bcalls / total * 100:.0f}% of all calls · "
-                 f"an eth_call costs ~{eth_alone:.0f} ms alone but ~{big:.0f} ms in a 100+ batch "
-                 f"({eth_alone / big:.0f}× cheaper), where {dist['100+']['calls'] / total * 100:.0f}% of calls ride")
+                 subtitle)
 
 
 # ===================== what one node serves: calls and breadth
 def mix_chart():
-    """Two aligned panels by namespace — call volume and breadth (distinct
-    methods). Each ranks the namespaces differently (eth dominates by calls,
-    Filecoin has the widest API), so one chart shows what a single Forest node
-    actually serves. The response-bytes panel was dropped — reviewer: not
-    useful for high-level decision makers."""
+    """Call volume and method breadth by RPC namespace."""
     df = (rq.namespace_coverage(after_path)
             .filter(pl.col("namespace") != "other"))
     total = df["calls"].sum()
@@ -597,13 +515,7 @@ def cdf_chart():
 
 
 def scorecard_chart():
-    """Top methods as a shaded table: calls, mean & p95 before→after, coloured
-    by how much each moved (green faster, red slower). Reads like a leaderboard.
-
-    Methods with too few requests in the *before* run to compare reliably
-    (e.g. trace_block had only 12) are left grey and marked, never coloured as a
-    win or loss off a noisy baseline.
-    """
+    """Top methods leaderboard: calls, mean/p95 before→after, shaded by delta."""
     MIN_N = 100  # below this, the earlier run's baseline is statistical noise
     cols = ("n", "mean", "p95")
     a = rq.singleton_per_method(before_path).select("method", *cols).rename({c: f"{c}_a" for c in cols})
@@ -737,12 +649,12 @@ print(f"A = {A['label']}   ({before_path})")
 print(f"B = {B['label']}   ({after_path})")
 
 # latency-comparison charts (PNG) — our node (B) leads the title and the bars
-render("per-flow",            "latency-per-flow.png", f"Per-flow latency: {B_LBL} vs {A_LBL} (ms)")
-render("per-call amortized",  "latency-per-call.png", f"Per-call amortized latency: {B_LBL} vs {A_LBL} (ms)")
+render("per-flow",            "latency-per-flow.png", f"Per-flow latency ({B_AXIS} vs {A_AXIS}, ms)")
+render("per-call amortized",  "latency-per-call.png", f"Per-call amortized latency ({B_AXIS} vs {A_AXIS}, ms)")
 
 qcols = ("n", "mean", "p95")
-ma = per_method(before_path).rename({c: f"{c}_a" for c in qcols})
-mb = per_method(after_path).rename({c: f"{c}_b" for c in qcols})
+ma = rq.singleton_per_method(before_path).select("method", *qcols).rename({c: f"{c}_a" for c in qcols})
+mb = rq.singleton_per_method(after_path).select("method", *qcols).rename({c: f"{c}_b" for c in qcols})
 method_table = (
     ma.join(mb, on="method", how="full", coalesce=True)
       .sort(pl.max_horizontal("n_a", "n_b"), descending=True, nulls_last=True)
@@ -750,8 +662,8 @@ method_table = (
 )
 render_method(method_table)
 
-render_batch("duration_ms", "latency-batch-per-flow.png", f"Batched per-flow duration: {B_LBL} vs {A_LBL} (ms)")
-render_batch("per_call_ms", "latency-batch-per-call.png", f"Batched per-call amortized: {B_LBL} vs {A_LBL} (ms)")
+render_batch("duration_ms", "latency-batch-per-flow.png", f"Batched per-flow duration ({B_AXIS} vs {A_AXIS}, ms)")
+render_batch("per_call_ms", "latency-batch-per-call.png", f"Batched per-call amortized ({B_AXIS} vs {A_AXIS}, ms)")
 
 # single-run business deck (PNG, from the AFTER parquet)
 save(reliability_hero(), out_dir / "reliability.png")

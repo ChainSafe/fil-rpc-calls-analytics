@@ -83,16 +83,16 @@ def load_compare(bp, ap, bw, aw):
 
     chart = alt.vconcat(
         panel("cpu", "cpu",
-              f"server CPU used (%) — {cores} cores · avg {B_LBL} {sb['cpu']:.0f}% vs {A_LBL} {sa['cpu']:.0f}% "
+              f"server CPU used (%) — {cores} cores · avg {B_AXIS} {sb['cpu']:.0f}% vs {A_AXIS} {sa['cpu']:.0f}% "
               f"({abs(cores_d):.1f} cores {'fewer' if cpu_d < 0 else 'more'})",
               105),
         panel("mem", "mem",
-              f"server memory used (GB) — of {total:.0f} GB · avg {B_LBL} {sb['mem']:.1f} GB vs {A_LBL} {sa['mem']:.1f} GB "
+              f"server memory used (GB) — of {total:.0f} GB · avg {B_AXIS} {sb['mem']:.1f} GB vs {A_AXIS} {sa['mem']:.1f} GB "
               f"({abs(mem_d):.1f} GB {'less' if mem_d < 0 else 'more'})",
               105, bottom=True),
         spacing=12,
     ).resolve_scale(color="shared")
-    return style(chart, f"Under real load — {B_LBL} vs {A_LBL}",
+    return style(chart, f"Under real load — {B_AXIS} vs {A_AXIS}",
                  f"what serving the same workload cost the server — "
                  f"the first {span:.0f} hours of each run, on one clock", **RES)
 
@@ -148,10 +148,9 @@ for tag, p, t0, span, w in [("before", before_path, bt0, bspan, bw),
 
 A = rq.node_identity(before_path)
 B = rq.node_identity(after_path)
-A_LBL, B_LBL = A["agent"], B["agent"]
-if A_LBL == B_LBL:                        # same agent (two builds) -> disambiguate by commit
-    A_LBL, B_LBL = f"{A['agent']} {A['commit'][:7]}", f"{B['agent']} {B['commit'][:7]}"
-A_FULL, B_FULL = A["label"], B["label"]   # agent + version, for the node colour legend
+A_AXIS, B_AXIS = A["agent"], B["agent"]
+A_FULL, B_FULL = A["label"], B["label"]
+VERSUS = f"{B_FULL} vs {A_FULL}"
 
 print(f"A = {A['label']} ({bw})   B = {B['label']} ({aw})   ->  {out}")
 save(load_compare(before_path, after_path, bw, aw), out / "load-over-time.png")

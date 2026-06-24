@@ -36,7 +36,7 @@ All analysis tasks read `calls.parquet` by default; override with `PARQUET=path 
 
 Polished charts land in `charts/`, split by the data they need:
 
-- **Parquet only** — `mise run charts <node-a.parquet> <node-b.parquet>` renders the business deck (`reliability`, `batching`, `what-node-serves`) plus the node-vs-node latency comparisons (charts self-label from the data via `Filecoin.Version`, e.g. "Forest v0.33.6 vs Lotus v1.36.1-dev") — all PNG. No DigitalOcean data required.
+- **Parquet only** — `mise run charts <node-a.parquet> <node-b.parquet>` renders the business deck (`reliability`, `batching`, `what-node-serves`) plus the node-vs-node latency comparisons. Charts self-label: Forest from capture (`Forest: 2026-06-15-8602bfd`), Lotus from GitHub `master` (`Lotus: v1.36.1-dev`) — all PNG. No DigitalOcean data required.
 - **Parquet + DigitalOcean** — `mise run charts-do <node-a.parquet> <node-b.parquet>` renders `load-over-time`: both nodes' whole-server CPU and memory overlaid on one clock, over the same observation window (trimmed to the shorter run). Needs `do-metrics/` populated.
 
 Populate `do-metrics/` first (the window is auto-derived from each parquet, so the resource data lines up with the captured traffic):
