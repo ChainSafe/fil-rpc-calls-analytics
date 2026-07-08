@@ -27,8 +27,10 @@ docker compose up -d --build
   - `= GATEWAY_PORT` → **front of the Gateway** (nginx↔Gateway): original method
     names (`eth_call`) + responses. Default, best match to existing parquet.
   - `= Forest's port` → **Gateway↔Forest**: methods as Forest sees them.
-- Capture files rotate hourly into `deploy/captures/` (24 kept). These are
-  **confidential** — git-ignored; copy them to the analysis box out-of-band.
+- Capture files rotate hourly into `deploy/captures/` with timestamped names.
+  A `pcap-prune` sidecar caps total usage at **200 GiB** (env `MAX_GB`), deleting
+  the oldest files first once the budget is exceeded. These are **confidential** —
+  git-ignored; copy them to the analysis box out-of-band.
 
 ## On the dev box (existing uv/mise)
 
