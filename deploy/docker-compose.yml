@@ -40,12 +40,42 @@ services:
       CAP_PORT: "3456"             # = GATEWAY_PORT (front-of-Gateway) or Forest's port
     volumes:
       - ./captures:/captures
-    # rotate hourly, keep 24 files; -s 0 = full payload (needed to recover bodies).
+    # rotate hourly into timestamped files; -s 0 = full payload (needed to recover bodies).
+    # No -W: with -G, -W makes tcpdump *exit* at the limit (not overwrite), and combined
+    # with -C it is ignored — either way it can't bound disk here. The pcap-prune sidecar
+    # enforces the total-size cap instead.
     # $$ escapes compose interpolation so the shell expands the env vars at runtime.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
         exec tcpdump -i "$$CAP_IFACE" -s 0
-        -w /captures/cap-%Y%m%d-%H%M%S.pcap -G 3600 -W 24
+        -w /captures/cap-%Y%m%d-%H%M%S.pcap -G 3600
         "tcp port $$CAP_PORT"
+    restart: unless-stopped
+
+  # Keeps ./captures under MAX_GB (GiB): every INTERVAL seconds, delete the oldest
+  # *.pcap until total usage is back under budget. Never deletes the last remaining
+  # file (tcpdump is actively writing it). No network needed — only the volume.
+  pcap-prune:
+    image: alpine:3.20
+    environment:
+      MAX_GB: "200"                # total-size budget for ./captures, in GiB
+      INTERVAL: "300"              # seconds between sweeps
+    volumes:
+      - ./captures:/captures
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        MAX_KIB=$$(( MAX_GB * 1024 * 1024 ));
+        while true; do
+          while [ "$$(du -sk /captures 2>/dev/null | cut -f1)" -gt "$$MAX_KIB" ]; do
+            n=$$(ls -1 /captures/*.pcap 2>/dev/null | wc -l);
+            [ "$$n" -le 1 ] && break;
+            oldest=$$(ls -1tr /captures/*.pcap 2>/dev/null | head -n1);
+            [ -z "$$oldest" ] && break;
+            echo "pcap-prune: over $${MAX_GB}GiB, removing $$oldest";
+            rm -f "$$oldest";
+          done;
+          sleep "$$INTERVAL";
+        done
     restart: unless-stopped
